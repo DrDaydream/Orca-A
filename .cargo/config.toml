@@ -1,0 +1,10 @@
+# RocksDB 6.20.3 uses bindgen 0.59, which is not compatible with the
+# anonymous-enum names produced by newer Clang releases. Pin the native
+# build to the installed Clang 14 toolchain so `cargo build` and `fab local`
+# work without requiring shell-specific environment variables.
+[env]
+LIBCLANG_PATH = { value = "/usr/lib/llvm-14/lib", force = true }
+CLANG_PATH = { value = "/usr/bin/clang-14", force = true }
+CC = { value = "/usr/bin/clang-14", force = true }
+CXX = { value = "/usr/bin/clang++-14", force = true }
+CXXFLAGS = { value = "-include cstdint", force = true }
