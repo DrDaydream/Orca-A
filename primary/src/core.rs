@@ -10,7 +10,7 @@ use bytes::Bytes;
 use config::Committee;
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey, SignatureService};
-use log::{debug, error, warn};
+use log::{debug, error, trace, warn};
 use network::{CancelHandler, ReliableSender};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -384,7 +384,7 @@ impl Core {
             .append(vote, &self.committee, &certificate)?;
 
         if let Some(proof) = proof {
-            debug!("Assembled GRBC grade-2 proof for {:?}", certificate);
+            trace!("Assembled GRBC grade-2 proof for {:?}", certificate);
             let addresses = self
                 .committee
                 .others_primaries(&self.name)
@@ -406,7 +406,7 @@ impl Core {
     async fn process_graded_certificate(&mut self, proof: GradedCertificate) -> DagResult<()> {
         let digest = proof.certificate.digest();
         if self.grade_two.insert(digest.clone()) {
-            debug!("GRBC grade 2 delivered for {:?}", proof.certificate);
+            trace!("GRBC grade 2 delivered for {:?}", proof.certificate);
             self.tx_consensus
                 .send(ConsensusMessage::GradeTwo(proof.certificate.clone()))
                 .await

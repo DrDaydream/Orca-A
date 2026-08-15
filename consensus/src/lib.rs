@@ -2,7 +2,7 @@
 use config::{Committee, Stake};
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey};
-use log::{debug, info, log_enabled, warn};
+use log::{debug, info, log_enabled, trace, warn};
 use primary::{Certificate, ConsensusMessage, Round};
 use std::cmp::max;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -220,13 +220,13 @@ impl Consensus {
         while let Some(message) = self.rx_primary.recv().await {
             let (observed_round, _promoted) = match message {
                 ConsensusMessage::GradeOne(certificate) => {
-                    debug!("Grade 1 delivered {:?}", certificate);
+                    trace!("Grade 1 delivered {:?}", certificate);
                     let round = certificate.round();
                     state.insert_grade_one(certificate);
                     (round, state.promote_ready())
                 }
                 ConsensusMessage::GradeTwo(certificate) => {
-                    debug!("Grade 2 delivered {:?}", certificate);
+                    trace!("Grade 2 delivered {:?}", certificate);
                     let round = certificate.round();
                     state.grade_two.insert(certificate.digest());
                     (round, state.promote_ready())
