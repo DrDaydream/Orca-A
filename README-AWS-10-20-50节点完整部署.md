@@ -6,6 +6,34 @@
 
 > 重要：50 台 EC2 会产生明显费用，公网 IPv4、EBS 和跨可用区流量也可能收费。第一次务必先用 10 台、20 秒、10,000 TPS 跑通，并在测试后停止或终止实例。先在 AWS 的 Service Quotas 检查按需实例 vCPU 配额。
 
+## 当前代码版本与本次优化
+
+本文适用于包含提交 `d446a42` 或更新版本的 Orca-A。该版本已包含：
+
+- VDag 使用依赖计数和事件队列晋级，不再反复扫描整个 VDag；
+- READY 使用固定大小验签池与无界工作队列；
+- pending leader 和缺失因果历史采用定点唤醒；
+- 生产节点以完整的有序 `Vec<Certificate>` 批量交给应用层，Cleanup 也批量发送。
+
+这些优化不改变命令行参数、端口或日志解析格式，因此旧的 AWS committee 和 benchmark 命令仍然可用。但所有服务器必须运行同一次编译产生的版本，不能混用优化前后的二进制。
+
+已经部署过 Orca-A 的服务器可在停止整个集群后统一更新：
+
+```bash
+cd /home/ubuntu/Orca-A
+git pull --ff-only origin main
+git rev-parse --short HEAD
+source "$HOME/.cargo/env"
+LIBCLANG_PATH=/usr/lib/llvm-14/lib \
+CLANG_PATH=/usr/bin/clang-14 \
+CC=/usr/bin/clang-14 \
+CXX=/usr/bin/clang++-14 \
+CXXFLAGS='-include cstdint' \
+cargo build --release --features benchmark
+```
+
+`git rev-parse` 应显示 `d446a42` 或更新的提交。
+
 ## 0. 本教程统一使用的约定
 
 - 系统：Ubuntu Server 24.04 LTS（22.04 也可以）；
@@ -381,6 +409,25 @@ chmod +x /home/ubuntu/orca-deploy/prepare-cluster.sh
 
 ## 11. 创建通用运行脚本
 
+最新仓库已自带经过检查的 `run-multi-servers.sh`，推荐直接使用：
+
+```bash
+cd /home/ubuntu/Orca-A
+chmod +x run-multi-servers.sh
+HOSTS_FILE=/home/ubuntu/orca-deploy/hosts-10.txt ./run-multi-servers.sh 10 20 10000
+```
+
+脚本默认使用 `ubuntu` 用户和 `/home/ubuntu/Orca-A`。如果 AMI 使用其他用户或目录，可以显式覆盖：
+
+```bash
+REMOTE_USER=ec2-user \
+REMOTE_DIR=/home/ec2-user/Orca-A \
+HOSTS_FILE=/home/ec2-user/orca-deploy/hosts-10.txt \
+./run-multi-servers.sh 10 20 10000
+```
+
+下面仍保留完整脚本内容，便于无法直接拉取仓库时手工创建。
+
 在 Node 0 执行：
 
 ```bash
@@ -568,6 +615,24 @@ cd /home/ubuntu/Orca-A
 ```text
 /home/ubuntu/Orca-A/benchmark/logs/
 ```
+
+应用层批量输出是节点内部接口优化，不会把多条 benchmark 日志合并成一行；`Committed ...` 日志和最终 TPS/latency 输出格式保持不变。
+
+### 12.1 20/50 节点资源建议
+
+READY 验签池最多使用 4 个常驻线程；工作队列无界是为了避免 Core 在突发 READY 流量下阻塞。因此建议每台实例至少 4 vCPU，推荐 8 vCPU，并在高压测试中监控 CPU 和内存：
+
+```bash
+while read -r ip; do
+  echo "===== $ip ====="
+  ssh "$ip" 'free -h; nproc; ps -C node -o pid,%cpu,%mem,rss,etime,cmd'
+done < /home/ubuntu/orca-deploy/hosts-20.txt
+```
+
+- 10 节点先用 10,000 总 TPS 验证；
+- 20/50 节点先保持总 TPS 不变，不要直接按节点数倍增输入；
+- 如果内存持续增长且提交延迟同时上升，先降低输入速率；
+- 所有实例应使用同一实例类型和同一可用区，避免把硬件差异误认为协议延迟。
 
 ## 13. 为什么一直显示 ready=0/N
 

@@ -15,9 +15,12 @@ esac
 [[ "$DURATION" =~ ^[1-9][0-9]*$ ]] || { echo "持续秒数必须是正整数" >&2; exit 2; }
 [[ "$TOTAL_RATE" =~ ^[1-9][0-9]*$ ]] || { echo "TPS 必须是正整数" >&2; exit 2; }
 
-REMOTE_USER="${REMOTE_USER:-root}"
-REMOTE_DIR="${REMOTE_DIR:-/root/Orca-A}"
-HOSTS_FILE="${HOSTS_FILE:-deploy/hosts-${NODES}.txt}"
+REMOTE_USER="${REMOTE_USER:-ubuntu}"
+REMOTE_DIR="${REMOTE_DIR:-/home/ubuntu/Orca-A}"
+DEFAULT_HOSTS="deploy/hosts-${NODES}.txt"
+[[ -f "/home/ubuntu/orca-deploy/hosts-${NODES}.txt" ]] \
+  && DEFAULT_HOSTS="/home/ubuntu/orca-deploy/hosts-${NODES}.txt"
+HOSTS_FILE="${HOSTS_FILE:-$DEFAULT_HOSTS}"
 MAX_PARALLEL="${MAX_PARALLEL:-10}"
 READY_TIMEOUT="${READY_TIMEOUT:-180}"
 TX_SIZE="${TX_SIZE:-512}"
@@ -163,4 +166,3 @@ nodes = int(sys.argv[1])
 print(LogParser.process("logs", faults=0).result())
 print(f"Parsed {nodes} active nodes with faults=0")
 PY
-
