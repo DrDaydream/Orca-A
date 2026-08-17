@@ -102,8 +102,16 @@ class LogParser:
         tmp = [(d, self._to_posix(t)) for t, d in tmp]
         proposals = self._merge_results([tmp])
 
-        tmp = findall(r'\[(.*Z) .* Committed B\d+\([^ ]+\) -> ([^ ]+=)', log)
-        tmp = [(d, self._to_posix(t)) for t, d in tmp]
+        # The optional numeric field records when the carrying leader first
+        # completed its commit rule. Legacy logs without it keep using the
+        # logger timestamp.
+        tmp = findall(
+            r'Committed B\d+\([^ ]+\) -> ([^ ]+=) @ (\d+)', log
+        )
+        tmp = [(d, int(t) / 1_000) for d, t in tmp]
+        if not tmp:
+            tmp = findall(r'\[(.*Z) .* Committed B\d+\([^ ]+\) -> ([^ ]+=)', log)
+            tmp = [(d, self._to_posix(t)) for t, d in tmp]
         commits = self._merge_results([tmp])
 
         configs = {

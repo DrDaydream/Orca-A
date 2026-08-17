@@ -15,7 +15,7 @@ thiserror = "1.0.20"
 bincode = "1.3.1"
 bytes = "1.0.1"
 env_logger = "0.7.1"
-log = "0.4.11"
+log = { version = "0.4.11", features = ["max_level_info", "release_max_level_info"] }
 async-recursion = "0.3.2"
 async-trait = "0.1.50"
 

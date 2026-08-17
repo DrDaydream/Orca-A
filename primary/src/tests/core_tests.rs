@@ -23,6 +23,7 @@ async fn process_header() {
     let (_tx_certificates_loopback, rx_certificates_loopback) = channel(1);
     let (_tx_headers, rx_headers) = channel(1);
     let (tx_consensus, _rx_consensus) = channel(1);
+    let (_tx_consensus_commands, rx_consensus_commands) = channel(1);
     let (tx_parents, _rx_parents) = channel(1);
 
     // Create a new test store.
@@ -62,6 +63,7 @@ async fn process_header() {
         /* rx_header_waiter */ rx_headers_loopback,
         /* rx_certificate_waiter */ rx_certificates_loopback,
         /* rx_proposer */ rx_headers,
+        /* rx_consensus */ rx_consensus_commands,
         tx_consensus,
         /* tx_proposer */ tx_parents,
     );
@@ -100,6 +102,7 @@ async fn process_header_missing_parent() {
     let (_tx_certificates_loopback, rx_certificates_loopback) = channel(1);
     let (_tx_headers, rx_headers) = channel(1);
     let (tx_consensus, _rx_consensus) = channel(1);
+    let (_tx_consensus_commands, rx_consensus_commands) = channel(1);
     let (tx_parents, _rx_parents) = channel(1);
 
     // Create a new test store.
@@ -129,6 +132,7 @@ async fn process_header_missing_parent() {
         /* rx_header_waiter */ rx_headers_loopback,
         /* rx_certificate_waiter */ rx_certificates_loopback,
         /* rx_proposer */ rx_headers,
+        /* rx_consensus */ rx_consensus_commands,
         tx_consensus,
         /* tx_proposer */ tx_parents,
     );
@@ -160,6 +164,7 @@ async fn process_header_missing_payload() {
     let (_tx_certificates_loopback, rx_certificates_loopback) = channel(1);
     let (_tx_headers, rx_headers) = channel(1);
     let (tx_consensus, _rx_consensus) = channel(1);
+    let (_tx_consensus_commands, rx_consensus_commands) = channel(1);
     let (tx_parents, _rx_parents) = channel(1);
 
     // Create a new test store.
@@ -189,6 +194,7 @@ async fn process_header_missing_payload() {
         /* rx_header_waiter */ rx_headers_loopback,
         /* rx_certificate_waiter */ rx_certificates_loopback,
         /* rx_proposer */ rx_headers,
+        /* rx_consensus */ rx_consensus_commands,
         tx_consensus,
         /* tx_proposer */ tx_parents,
     );
@@ -222,6 +228,7 @@ async fn process_votes() {
     let (_tx_certificates_loopback, rx_certificates_loopback) = channel(1);
     let (_tx_headers, rx_headers) = channel(1);
     let (tx_consensus, _rx_consensus) = channel(1);
+    let (_tx_consensus_commands, rx_consensus_commands) = channel(1);
     let (tx_parents, _rx_parents) = channel(1);
 
     // Create a new test store.
@@ -251,6 +258,7 @@ async fn process_votes() {
         /* rx_header_waiter */ rx_headers_loopback,
         /* rx_certificate_waiter */ rx_certificates_loopback,
         /* rx_proposer */ rx_headers,
+        /* rx_consensus */ rx_consensus_commands,
         tx_consensus,
         /* tx_proposer */ tx_parents,
     );
@@ -293,7 +301,8 @@ async fn process_certificates() {
     let (_tx_headers_loopback, rx_headers_loopback) = channel(1);
     let (_tx_certificates_loopback, rx_certificates_loopback) = channel(1);
     let (_tx_headers, rx_headers) = channel(1);
-    let (tx_consensus, mut rx_consensus) = channel(3);
+    let (tx_consensus, mut rx_consensus) = channel(6);
+    let (_tx_consensus_commands, rx_consensus_commands) = channel(1);
     let (tx_parents, mut rx_parents) = channel(1);
 
     // Create a new test store.
@@ -323,6 +332,7 @@ async fn process_certificates() {
         /* rx_header_waiter */ rx_headers_loopback,
         /* rx_certificate_waiter */ rx_certificates_loopback,
         /* rx_proposer */ rx_headers,
+        /* rx_consensus */ rx_consensus_commands,
         tx_consensus,
         /* tx_proposer */ tx_parents,
     );
@@ -346,10 +356,15 @@ async fn process_certificates() {
 
     // Ensure the core sends the certificates to the consensus.
     for x in certificates.clone() {
-        let received = rx_consensus.recv().await.unwrap();
-        match received {
+        match rx_consensus.recv().await.unwrap() {
+            ConsensusMessage::Observed(header) => assert_eq!(header.id, x.header.id),
+            message => panic!("unexpected first delivery: {:?}", message),
+        }
+        match rx_consensus.recv().await.unwrap() {
             ConsensusMessage::GradeOne(certificate) => assert_eq!(certificate, x),
             ConsensusMessage::GradeTwo(_) => panic!("unexpected grade-2 delivery"),
+            ConsensusMessage::RoundAdvanced(_) => panic!("unexpected round advancement"),
+            ConsensusMessage::Observed(_) => panic!("duplicate observation"),
         }
     }
 

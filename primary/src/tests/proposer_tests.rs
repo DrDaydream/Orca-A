@@ -108,3 +108,38 @@ async fn propose_grbc_edges() {
     assert!(header.virtual_edges.contains(&virtual_edge));
     assert!(header.verify(&committee()).is_ok());
 }
+
+#[tokio::test]
+async fn proposer_jumps_to_a_higher_quorum_round() {
+    let (name, secret) = keys().pop().unwrap();
+    let signature_service = SignatureService::new(secret);
+    let (tx_parents, rx_parents) = channel(1);
+    let (_tx_our_digests, rx_our_digests) = channel(1);
+    let (tx_headers, mut rx_headers) = channel(1);
+
+    Proposer::spawn(
+        name,
+        &committee(),
+        signature_service,
+        1_000,
+        20,
+        rx_parents,
+        rx_our_digests,
+        tx_headers,
+    );
+
+    // Consume the initial round-1 proposal, then emulate Core delivering the
+    // aggregated GRBC parent set for a substantially higher round. In
+    // production Core emits this tuple only after its quorum aggregator fires.
+    rx_headers.recv().await.unwrap();
+    let parent = Digest([9; 32]);
+    tx_parents
+        .send((vec![parent.clone()], Vec::new(), Vec::new(), 5))
+        .await
+        .unwrap();
+
+    let header = rx_headers.recv().await.unwrap();
+    assert_eq!(header.round, 6);
+    assert!(header.parents.contains(&parent));
+    assert!(header.verify(&committee()).is_ok());
+}

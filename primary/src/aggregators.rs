@@ -80,6 +80,11 @@ impl VotesAggregator {
     ) -> DagResult<Option<Certificate>> {
         let author = vote.author;
 
+        ensure!(
+            vote.id == header.id && vote.round == header.round && vote.origin == header.author,
+            DagError::UnexpectedVote(vote.id)
+        );
+
         // Ensure it is the first time this authority votes.
         ensure!(self.used.insert(author), DagError::AuthorityReuse(author));
 

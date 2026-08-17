@@ -222,10 +222,29 @@ impl GradeVote {
         author: &PublicKey,
         signature_service: &mut SignatureService,
     ) -> Self {
+        Self::new_for(
+            certificate.digest(),
+            certificate.round(),
+            certificate.origin(),
+            author,
+            signature_service,
+        )
+        .await
+    }
+
+    /// Create a READY relay after observing f+1 matching READY messages. The
+    /// certificate data may arrive later; READY signatures bind all metadata.
+    pub async fn new_for(
+        id: Digest,
+        round: Round,
+        origin: PublicKey,
+        author: &PublicKey,
+        signature_service: &mut SignatureService,
+    ) -> Self {
         let vote = Self {
-            id: certificate.digest(),
-            round: certificate.round(),
-            origin: certificate.origin(),
+            id,
+            round,
+            origin,
             author: *author,
             signature: Signature::default(),
         };
@@ -273,8 +292,19 @@ pub struct GradedCertificate {
 /// Delivery events emitted by the primary to the consensus layer.
 #[derive(Clone, Debug)]
 pub enum ConsensusMessage {
+    /// Core formed a quorum for `round - 1`, so the local node entered this round.
+    RoundAdvanced(Round),
+    /// A valid author-signed block observed before any quorum certificate or grade.
+    Observed(Header),
     GradeOne(Certificate),
     GradeTwo(Certificate),
+}
+
+#[derive(Debug)]
+pub enum ConsensusCommand {
+    Cleanup(Certificate),
+    CleanupBatch(Vec<Certificate>),
+    LeaderRequest(Round, PublicKey),
 }
 
 impl GradedCertificate {
