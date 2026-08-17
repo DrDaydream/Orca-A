@@ -16,7 +16,8 @@ use log::{debug, error, trace, warn};
 use network::{CancelHandler, ReliableSender};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::mpsc::{channel as work_channel, Sender as WorkSender};
+use std::sync::{Arc, Mutex};
 use store::Store;
 use tokio::sync::mpsc::{Receiver, Sender};
 
@@ -701,6 +702,37 @@ impl Core {
         // machine, keeping support aggregation deterministic and race-free.
         let (tx_verified_ready, mut rx_verified_ready) =
             tokio::sync::mpsc::unbounded_channel::<(GradeVote, DagResult<()>)>();
+        type ReadyJob = (Round, GradeVote);
+        let worker_count = std::thread::available_parallelism()
+            .map(|count| count.get())
+            .unwrap_or(2)
+            .min(4)
+            .max(1);
+        // Keep the CPU concurrency fixed while allowing Core to accept READY
+        // bursts without blocking the GRBC state machine.
+        let (tx_ready_jobs, rx_ready_jobs) = work_channel::<ReadyJob>();
+        let rx_ready_jobs = Arc::new(Mutex::new(rx_ready_jobs));
+        let verification_committee = Arc::new(self.committee.clone());
+        for _ in 0..worker_count {
+            let jobs = rx_ready_jobs.clone();
+            let results = tx_verified_ready.clone();
+            let committee = verification_committee.clone();
+            std::thread::spawn(move || loop {
+                let job = jobs.lock().expect("READY verifier queue poisoned").recv();
+                let (gc_round, vote) = match job {
+                    Ok(job) => job,
+                    Err(_) => break,
+                };
+                let result = Self::verify_grade_vote(&committee, gc_round, &vote);
+                if results.send((vote, result)).is_err() {
+                    break;
+                }
+            });
+        }
+        let submit_ready = |vote: GradeVote, gc_round: Round, jobs: &WorkSender<ReadyJob>| {
+            jobs.send((gc_round, vote))
+                .expect("READY verifier pool stopped");
+        };
         loop {
             let result = tokio::select! {
                 // We receive here messages from other primaries.
@@ -726,13 +758,7 @@ impl Core {
                             }
                         },
                         PrimaryMessage::GradeVote(vote) => {
-                            let committee = self.committee.clone();
-                            let gc_round = self.gc_round;
-                            let tx_verified_ready = tx_verified_ready.clone();
-                            tokio::task::spawn_blocking(move || {
-                                let result = Self::verify_grade_vote(&committee, gc_round, &vote);
-                                let _ = tx_verified_ready.send((vote, result));
-                            });
+                            submit_ready(vote, self.gc_round, &tx_ready_jobs);
                             Ok(())
                         },
                         PrimaryMessage::GradedCertificate(proof) => {

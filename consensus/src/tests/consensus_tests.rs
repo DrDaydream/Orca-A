@@ -129,7 +129,7 @@ fn future_round_block_is_kept_through_all_grbc_stages() {
         .and_then(|round| round.get(&authority))
         .is_some());
 
-    state.grade_two.insert(digest.clone());
+    state.mark_grade_two(digest.clone());
     state.promote_ready();
     assert!(state.dag_digests.contains(&digest));
     assert!(state.vdag.get(&10).map_or(true, |round| {
@@ -145,7 +145,7 @@ async fn higher_round_jump_checks_each_crossed_round_once() {
         gc_depth: 50,
         rx_primary: channel(1).1,
         tx_primary: channel(10).0,
-        tx_output: channel(10).0,
+        tx_output: OutputSender::Individual(channel(10).0),
         genesis: Certificate::genesis(&committee),
     };
     let mut state = State::new(Certificate::genesis(&committee));
@@ -172,12 +172,12 @@ fn grade_two_waits_for_strong_and_weak_edges() {
     let block_digest = block.digest();
 
     state.insert_grade_one(block);
-    state.grade_two.insert(block_digest.clone());
+    state.mark_grade_two(block_digest.clone());
     assert!(state.promote_ready().is_empty());
     assert!(state.vdag.get(&3).unwrap().contains_key(&authority));
 
     state.insert_grade_one(dependency);
-    state.grade_two.insert(dependency_digest);
+    state.mark_grade_two(dependency_digest);
     let promoted = state.promote_ready();
     assert_eq!(promoted.len(), 2);
     assert!(state.dag_digests.contains(&block_digest));
@@ -192,7 +192,7 @@ fn finds_paths_over_strong_and_weak_edges() {
         gc_depth: 50,
         rx_primary: channel(1).1,
         tx_primary: channel(1).0,
-        tx_output: channel(1).0,
+        tx_output: OutputSender::Individual(channel(1).0),
         genesis: Certificate::genesis(&committee),
     };
     let authorities: Vec<_> = keys().into_iter().map(|(key, _)| key).collect();
@@ -248,7 +248,7 @@ fn order_dag_includes_weak_parent_history() {
         gc_depth: 50,
         rx_primary: channel(1).1,
         tx_primary: channel(1).0,
-        tx_output: channel(1).0,
+        tx_output: OutputSender::Individual(channel(1).0),
         genesis: Certificate::genesis(&committee),
     };
     let mut state = State::new(Certificate::genesis(&committee));
@@ -275,7 +275,7 @@ fn designates_one_leader_every_round() {
         gc_depth: 50,
         rx_primary: channel(1).1,
         tx_primary: channel(1).0,
-        tx_output: channel(1).0,
+        tx_output: OutputSender::Individual(channel(1).0),
         genesis: Certificate::genesis(&committee),
     };
     let mut expected: Vec<_> = committee.authorities.keys().cloned().collect();
@@ -297,7 +297,7 @@ fn commit_rule_counts_observed_and_dag_strong_support_separately() {
         gc_depth: 50,
         rx_primary: channel(1).1,
         tx_primary: channel(1).0,
-        tx_output: channel(1).0,
+        tx_output: OutputSender::Individual(channel(1).0),
         genesis: Certificate::genesis(&committee),
     };
     let mut state = State::new(Certificate::genesis(&committee));
@@ -338,7 +338,7 @@ fn commit_rule_one_counts_pre_grade_one_grbc_observations() {
         gc_depth: 50,
         rx_primary: channel(1).1,
         tx_primary: channel(1).0,
-        tx_output: channel(1).0,
+        tx_output: OutputSender::Individual(channel(1).0),
         genesis: Certificate::genesis(&committee),
     };
     let mut state = State::new(Certificate::genesis(&committee));
@@ -364,7 +364,7 @@ fn rule_one_does_not_count_locally_present_unreferenced_leader() {
         gc_depth: 50,
         rx_primary: channel(1).1,
         tx_primary: channel(10).0,
-        tx_output: channel(10).0,
+        tx_output: OutputSender::Individual(channel(10).0),
         genesis: Certificate::genesis(&committee),
     };
     let mut state = State::new(Certificate::genesis(&committee));
@@ -394,7 +394,7 @@ async fn rule_one_promotes_observed_leader_and_causal_history_to_dag() {
         gc_depth: 50,
         rx_primary: channel(1).1,
         tx_primary,
-        tx_output,
+        tx_output: OutputSender::Individual(tx_output),
         genesis: Certificate::genesis(&committee),
     };
     let mut state = State::new(Certificate::genesis(&committee));
@@ -427,7 +427,7 @@ fn commit_ready_leader_promotes_from_observe_with_strong_and_weak_history() {
         gc_depth: 50,
         rx_primary: channel(1).1,
         tx_primary: channel(10).0,
-        tx_output: channel(10).0,
+        tx_output: OutputSender::Individual(channel(10).0),
         genesis: Certificate::genesis(&committee),
     };
     let mut state = State::new(Certificate::genesis(&committee));
@@ -480,7 +480,7 @@ fn commit_rule_two_counts_strong_and_two_hop_virtual_paths() {
         gc_depth: 50,
         rx_primary: channel(1).1,
         tx_primary: channel(10).0,
-        tx_output: channel(10).0,
+        tx_output: OutputSender::Individual(channel(10).0),
         genesis: Certificate::genesis(&committee),
     };
     let mut state = State::new(Certificate::genesis(&committee));
@@ -516,7 +516,7 @@ fn rule_two_does_not_count_locally_present_unreferenced_leader() {
         gc_depth: 50,
         rx_primary: channel(1).1,
         tx_primary: channel(10).0,
-        tx_output: channel(10).0,
+        tx_output: OutputSender::Individual(channel(10).0),
         genesis: Certificate::genesis(&committee),
     };
     let mut state = State::new(Certificate::genesis(&committee));
@@ -547,7 +547,7 @@ fn commit_rule_three_counts_exact_three_edge_virtual_paths() {
         gc_depth: 50,
         rx_primary: channel(1).1,
         tx_primary: channel(10).0,
-        tx_output: channel(10).0,
+        tx_output: OutputSender::Individual(channel(10).0),
         genesis: Certificate::genesis(&committee),
     };
     let mut state = State::new(Certificate::genesis(&committee));
@@ -588,7 +588,7 @@ fn commit_rule_three_paths_are_distinct_when_first_intermediate_differs() {
         gc_depth: 50,
         rx_primary: channel(1).1,
         tx_primary: channel(1).0,
-        tx_output: channel(1).0,
+        tx_output: OutputSender::Individual(channel(1).0),
         genesis: Certificate::genesis(&committee),
     };
     let mut state = State::new(Certificate::genesis(&committee));
@@ -625,7 +625,7 @@ async fn rule_three_skips_a_leader_without_any_observed_digest() {
         gc_depth: 50,
         rx_primary: channel(1).1,
         tx_primary,
-        tx_output,
+        tx_output: OutputSender::Individual(tx_output),
         genesis: Certificate::genesis(&committee),
     };
     let mut state = State::new(Certificate::genesis(&committee));
@@ -666,7 +666,7 @@ async fn rule_three_skips_locally_known_leader_not_referenced_by_observer_histor
         gc_depth: 50,
         rx_primary: channel(1).1,
         tx_primary,
-        tx_output,
+        tx_output: OutputSender::Individual(tx_output),
         genesis: Certificate::genesis(&committee),
     };
     let mut state = State::new(Certificate::genesis(&committee));
@@ -695,7 +695,7 @@ async fn rule_three_bridges_missing_leader_with_f_plus_one_history_blocks() {
         gc_depth: 50,
         rx_primary: channel(1).1,
         tx_primary,
-        tx_output,
+        tx_output: OutputSender::Individual(tx_output),
         genesis: Certificate::genesis(&committee),
     };
     let mut state = State::new(Certificate::genesis(&committee));
@@ -755,7 +755,7 @@ async fn commit_rule_two_condition_three_forces_leader_grade_two() {
         gc_depth: 50,
         rx_primary: channel(1).1,
         tx_primary,
-        tx_output,
+        tx_output: OutputSender::Individual(tx_output),
         genesis: Certificate::genesis(&committee),
     };
     let mut state = State::new(Certificate::genesis(&committee));
@@ -790,7 +790,7 @@ async fn leader_commits_wait_for_the_previous_leader() {
         gc_depth: 50,
         rx_primary: channel(1).1,
         tx_primary,
-        tx_output,
+        tx_output: OutputSender::Individual(tx_output),
         genesis: Certificate::genesis(&committee),
     };
     let mut state = State::new(Certificate::genesis(&committee));

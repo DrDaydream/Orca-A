@@ -5,7 +5,7 @@ use crypto::{Digest, PublicKey};
 use log::{debug, info, log_enabled, trace, warn};
 use primary::{Certificate, ConsensusCommand, ConsensusMessage, Round};
 use std::cmp::max;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::time::{self, Duration};
@@ -65,6 +65,12 @@ struct State {
     dag_strong_support: HashMap<(Round, Digest), HashSet<PublicKey>>,
     observed_direct_support: HashMap<(Round, Digest), HashSet<PublicKey>>,
     dag_direct_support: HashMap<(Round, Digest), HashSet<PublicKey>>,
+    /// Number of strong/weak dependencies not yet admitted to Dag.
+    missing_dependencies: HashMap<Digest, usize>,
+    /// Reverse waiters wake only VDag blocks affected by a new Dag insertion.
+    dependency_waiters: HashMap<Digest, HashSet<Digest>>,
+    /// Grade-2 blocks whose dependency count reached zero.
+    promotion_queue: VecDeque<Digest>,
     /// The authority designated as leader for every round.
     leaders: HashMap<Round, PublicKey>,
     /// Leader rounds already committed, preventing duplicate commits.
@@ -156,6 +162,9 @@ impl State {
             dag_strong_support: HashMap::new(),
             observed_direct_support: HashMap::new(),
             dag_direct_support: HashMap::new(),
+            missing_dependencies: HashMap::new(),
+            dependency_waiters: HashMap::new(),
+            promotion_queue: VecDeque::new(),
             leaders: HashMap::new(),
             committed_leaders: [0].iter().cloned().collect(),
             skipped_leaders: HashSet::new(),
@@ -320,6 +329,27 @@ impl State {
             .get(&round)
             .and_then(|blocks| blocks.get(&origin))
             .map_or(true, |(candidate, _)| candidate != &digest);
+        if inserted {
+            let missing: HashSet<_> = certificate
+                .header
+                .parents
+                .iter()
+                .chain(&certificate.header.weak_edges)
+                .filter(|dependency| !self.dag_digests.contains(*dependency))
+                .cloned()
+                .collect();
+            for dependency in &missing {
+                self.dependency_waiters
+                    .entry(dependency.clone())
+                    .or_default()
+                    .insert(digest.clone());
+            }
+            self.missing_dependencies
+                .insert(digest.clone(), missing.len());
+            if missing.is_empty() && self.grade_two.contains(&digest) {
+                self.promotion_queue.push_back(digest.clone());
+            }
+        }
         self.vdag
             .entry(round)
             .or_insert_with(HashMap::new)
@@ -363,7 +393,9 @@ impl State {
             .or_insert_with(HashMap::new)
             .insert(origin, (digest.clone(), certificate.clone()));
         self.dag_by_digest.insert(digest.clone(), certificate);
-        self.dag_digests.insert(digest.clone());
+        if !self.dag_digests.insert(digest.clone()) {
+            return;
+        }
         if let Some(ancestors) = self.strong_ancestors.get(&digest) {
             for ancestor in ancestors {
                 self.dag_strong_support
@@ -384,36 +416,50 @@ impl State {
                 .or_default()
                 .insert(origin);
         }
+        if let Some(waiters) = self.dependency_waiters.remove(&digest) {
+            for waiter in waiters {
+                if let Some(missing) = self.missing_dependencies.get_mut(&waiter) {
+                    *missing = missing.saturating_sub(1);
+                    if *missing == 0 && self.grade_two.contains(&waiter) {
+                        self.promotion_queue.push_back(waiter);
+                    }
+                }
+            }
+        }
         self.wake_pending(round);
     }
 
-    /// Promote every grade-2 VDag block whose strong and weak dependencies are
-    /// already present in Dag. Repeat because one promotion may unblock another.
+    fn mark_grade_two(&mut self, digest: Digest) -> bool {
+        let inserted = self.grade_two.insert(digest.clone());
+        if inserted
+            && self.missing_dependencies.get(&digest) == Some(&0)
+            && self.observed.contains_key(&digest)
+        {
+            self.promotion_queue.push_back(digest);
+        }
+        inserted
+    }
+
+    /// Event-driven VDag promotion. A dependency insertion decrements only its
+    /// direct waiters and queues newly ready grade-2 blocks.
     fn promote_ready(&mut self) -> Vec<Certificate> {
         let mut promoted = Vec::new();
-        loop {
-            let ready = self
-                .vdag
-                .values()
-                .flat_map(|authorities| authorities.values())
-                .find(|(digest, certificate)| {
-                    self.grade_two.contains(digest)
-                        && certificate
-                            .header
-                            .parents
-                            .iter()
-                            .chain(&certificate.header.weak_edges)
-                            .all(|dependency| self.dag_digests.contains(dependency))
-                })
-                .map(|(_, certificate)| certificate.clone());
-            match ready {
-                Some(certificate) => {
-                    self.promote_to_dag(certificate.clone());
-                    promoted.push(certificate);
-                }
-                None => return promoted,
+        while let Some(digest) = self.promotion_queue.pop_front() {
+            if self.dag_digests.contains(&digest)
+                || !self.grade_two.contains(&digest)
+                || self.missing_dependencies.get(&digest) != Some(&0)
+            {
+                continue;
             }
+            let certificate = match self.observed.get(&digest).cloned() {
+                Some(certificate) => certificate,
+                None => continue,
+            };
+            self.promote_to_dag(certificate.clone());
+            self.missing_dependencies.remove(&digest);
+            promoted.push(certificate);
         }
+        promoted
     }
 
     fn predecessor_resolved(&self, round: Round) -> bool {
@@ -485,6 +531,14 @@ impl State {
         self.dag_by_digest
             .retain(|digest, _| live_digests.contains(digest));
         self.dag_digests = live_digests;
+        self.missing_dependencies
+            .retain(|digest, _| observed_digests.contains(digest));
+        self.dependency_waiters.retain(|_, waiters| {
+            waiters.retain(|digest| observed_digests.contains(digest));
+            !waiters.is_empty()
+        });
+        self.promotion_queue
+            .retain(|digest| observed_digests.contains(digest));
         let dag_digests = &self.dag_digests;
         self.forced_history_waiters
             .retain(|digest, _| !dag_digests.contains(digest));
@@ -503,10 +557,16 @@ pub struct Consensus {
     /// Outputs the sequence of ordered certificates to the primary (for cleanup and feedback).
     tx_primary: Sender<ConsensusCommand>,
     /// Outputs the sequence of ordered certificates to the application layer.
-    tx_output: Sender<Certificate>,
+    tx_output: OutputSender,
 
     /// The genesis certificates.
     genesis: Vec<Certificate>,
+}
+
+#[derive(Clone)]
+enum OutputSender {
+    Individual(Sender<Certificate>),
+    Batch(Sender<Vec<Certificate>>),
 }
 
 impl Consensus {
@@ -523,7 +583,31 @@ impl Consensus {
                 gc_depth,
                 rx_primary,
                 tx_primary,
-                tx_output,
+                tx_output: OutputSender::Individual(tx_output),
+                genesis: Certificate::genesis(&committee),
+            }
+            .run()
+            .await;
+        });
+    }
+
+    /// Production entry point: one application-channel send per ordered DAG
+    /// sequence. The certificate-at-a-time API remains available to tests and
+    /// existing embedders through `spawn`.
+    pub fn spawn_batch(
+        committee: Committee,
+        gc_depth: Round,
+        rx_primary: Receiver<ConsensusMessage>,
+        tx_primary: Sender<ConsensusCommand>,
+        tx_output: Sender<Vec<Certificate>>,
+    ) {
+        tokio::spawn(async move {
+            Self {
+                committee: committee.clone(),
+                gc_depth,
+                rx_primary,
+                tx_primary,
+                tx_output: OutputSender::Batch(tx_output),
                 genesis: Certificate::genesis(&committee),
             }
             .run()
@@ -552,11 +636,22 @@ impl Consensus {
                     warn!("Commit cleanup channel closed");
                     return;
                 }
-                for certificate in sequence {
-                    if let Err(error) = tx_output.send(certificate).await {
-                        warn!("Failed to output certificate: {}", error);
-                        return;
+                let failed = match &tx_output {
+                    OutputSender::Batch(sender) => sender.send(sequence).await.is_err(),
+                    OutputSender::Individual(sender) => {
+                        let mut failed = false;
+                        for certificate in sequence {
+                            if sender.send(certificate).await.is_err() {
+                                failed = true;
+                                break;
+                            }
+                        }
+                        failed
                     }
+                };
+                if failed {
+                    warn!("Application output channel closed");
+                    return;
                 }
             }
         });
@@ -647,7 +742,7 @@ impl Consensus {
                     let digest = certificate.digest();
                     let first = !state.observed.contains_key(&digest);
                     let dirty = state.observe(certificate.clone());
-                    state.grade_two.insert(digest.clone());
+                    state.mark_grade_two(digest.clone());
                     (round, origin, digest, dirty, state.promote_ready(), first)
                 }
             };
@@ -864,7 +959,7 @@ impl Consensus {
                 "Commit rule 2 forces grade 2 for {:?}",
                 leader
             );
-            state.grade_two.insert(leader_digest.clone());
+            state.mark_grade_two(leader_digest.clone());
             state.promote_ready();
         }
 
@@ -1514,8 +1609,17 @@ impl Consensus {
                         .send(ConsensusCommand::Cleanup(certificate.clone()))
                         .await
                         .expect("Failed to send certificate to primary");
-                    if let Err(error) = self.tx_output.send(certificate).await {
-                        warn!("Failed to output certificate: {}", error);
+                    match &self.tx_output {
+                        OutputSender::Individual(sender) => {
+                            if let Err(error) = sender.send(certificate).await {
+                                warn!("Failed to output certificate: {}", error);
+                            }
+                        }
+                        OutputSender::Batch(sender) => {
+                            if let Err(error) = sender.send(vec![certificate]).await {
+                                warn!("Failed to output certificate batch: {}", error);
+                            }
+                        }
                     }
                 }
             }
