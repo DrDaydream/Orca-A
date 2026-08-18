@@ -45,7 +45,7 @@ The local benchmark parameters are in `benchmark/fabfile.py`. In particular:
 
 ~~~python
 bench_params = {
-    'faults': 1,
+    'faults': 0,
     'nodes': 4,
     'workers': 1,
     'rate': 50_000,
@@ -109,9 +109,63 @@ The options are:
 
 With `faults > 0`, every node derives the same f adversarial authorities for each round. An adversarial leader is routed to Rule 3. The non-adversarial Rule-1/Rule-2 schedule approaches a 1:1 split over longer runs. Percentages are calculated over all leaders, including Rule 3 leaders.
 
-### Example output
+### No-adversary baseline (`faults = 0`)
 
-The following is an actual result parsed from the repository's current 4-node, 1-fault, 20-second local benchmark logs. Performance varies by hardware and system load.
+Set `'faults': 0` in `benchmark/fabfile.py` and run from the benchmark directory:
+
+~~~bash
+RUST_LOG=info fab local
+~~~
+
+The following output was produced by a 4-node, 50,000 tx/s, 20-second local run:
+
+~~~text
+-----------------------------------------
+ SUMMARY:
+-----------------------------------------
+ + CONFIG:
+ Faults: 0 node(s)
+ Committee size: 4 node(s)
+ Worker(s) per node: 1 worker(s)
+ Collocate primary and workers: True
+ Input rate: 50,000 tx/s
+ Transaction size: 512 B
+ Execution time: 20 s
+
+ Header size: 1,000 B
+ Max header delay: 200 ms
+ GC depth: 50 round(s)
+ Sync retry delay: 10,000 ms
+ Sync retry nodes: 3 node(s)
+ batch size: 500,000 B
+ Max batch delay: 200 ms
+
+ + RESULTS:
+ Consensus TPS: 47,950 tx/s
+ Consensus BPS: 24,550,251 B/s
+ Consensus latency: 406 ms
+ Leader commit latency: 274 ms
+ Non-leader commit latency: 550 ms
+ All committed headers latency: 480 ms
+ Leader commit interval: 206 ms
+ Non-leader rule-order latency: 454 ms
+ Rule 1 leader ratio: 77.67%
+ Rule 2 leader ratio: 12.62%
+ Rule 3 commit leader ratio: 0.00%
+ Rule 3 skip leader ratio: 9.71%
+ Rule 1 block ratio: 84.96%
+ Rule 2 block ratio: 15.04%
+ Rule 3 block ratio: 0.00%
+
+ End-to-end TPS: 47,649 tx/s
+ End-to-end BPS: 24,396,273 B/s
+ End-to-end latency: 547 ms
+-----------------------------------------
+~~~
+
+### Preserved adversarial result (`faults = 1`)
+
+For comparison, this is the previously recorded 4-node, 1-fault, 20-second local result using the adversary commands above:
 
 ~~~text
 -----------------------------------------
