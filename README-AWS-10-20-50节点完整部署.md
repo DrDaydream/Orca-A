@@ -8,8 +8,8 @@
 |---|---|
 | AMI | Ubuntu Server 24.04 LTS，x86_64 |
 | 节点数 | 10、20 或 50 |
-| 登录用户 | `ubuntu` |
-| 项目目录 | `/home/ubuntu/Orca-A` |
+| 登录用户 | `root` |
+| 项目目录 | `/root/Orca-A` |
 | 仓库 | `https://github.com/DrDaydream/Orca-A.git` |
 | 推荐实例 | 至少 4 vCPU / 16 GiB，50 节点建议 8 vCPU |
 | 磁盘 | 至少 30 GiB gp3 |
@@ -17,6 +17,8 @@
 | 网络 | 同一 Region、同一 VPC，建议同一 AZ |
 
 先用 10 节点、20 秒、总输入 10,000 TPS 验证。创建 20/50 台前，在 AWS Service Quotas 检查目标实例系列的 On-Demand vCPU 配额。
+
+本文假设服务器已经允许 `root` 使用密钥直接 SSH。AWS 官方 Ubuntu AMI 通常默认禁用 root 直登；继续部署前必须先确认 `ssh -i KEY root@PUBLIC_IP` 成功，否则应在镜像层启用 root 登录或改用服务器实际允许的账户。
 
 协议要求 `n >= 3f+1`。建议使用：
 
@@ -77,8 +79,8 @@
 ~~~bash
 chmod 400 ~/Downloads/orca-a-aws.pem
 scp -i ~/Downloads/orca-a-aws.pem ~/Downloads/orca-a-aws.pem \
-  ubuntu@NODE0_PUBLIC_IP:/home/ubuntu/.ssh/orca-a-aws.pem
-ssh -i ~/Downloads/orca-a-aws.pem ubuntu@NODE0_PUBLIC_IP
+  root@NODE0_PUBLIC_IP:/root/.ssh/orca-a-aws.pem
+ssh -i ~/Downloads/orca-a-aws.pem root@NODE0_PUBLIC_IP
 ~~~
 
 进入 node-0 后：
@@ -92,8 +94,8 @@ nano ~/.ssh/config
 
 ~~~sshconfig
 Host 10.*
-    User ubuntu
-    IdentityFile /home/ubuntu/.ssh/orca-a-aws.pem
+    User root
+    IdentityFile /root/.ssh/orca-a-aws.pem
     StrictHostKeyChecking accept-new
     ConnectTimeout 8
     ServerAliveInterval 5
@@ -110,7 +112,7 @@ cp deploy/hosts-10.txt.example deploy/hosts-10.txt
 nano deploy/hosts-10.txt
 ~~~
 
-hosts 文件每行只写一个 Private IPv4，第一行必须是 node-0。不要写 `ubuntu@`、主机名、逗号或端口。20/50 节点创建 `deploy/hosts-20.txt` 或 `deploy/hosts-50.txt`。
+hosts 文件每行只写一个 Private IPv4，第一行必须是 node-0。不要写 `root@`、主机名、逗号或端口。20/50 节点创建 `deploy/hosts-20.txt` 或 `deploy/hosts-50.txt`。
 
 ~~~bash
 wc -l deploy/hosts-10.txt
@@ -302,9 +304,9 @@ ORCA_CLIENT_DURING_SILENCE=send \
 自定义路径时：
 
 ~~~bash
-REMOTE_USER=ubuntu \
-REMOTE_DIR=/home/ubuntu/Orca-A \
-HOSTS_FILE=/home/ubuntu/Orca-A/deploy/hosts-10.txt \
+REMOTE_USER=root \
+REMOTE_DIR=/root/Orca-A \
+HOSTS_FILE=/root/Orca-A/deploy/hosts-10.txt \
 ./run-multi-servers.sh 10 20 10000
 ~~~
 
