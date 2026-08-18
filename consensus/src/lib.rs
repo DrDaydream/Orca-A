@@ -190,13 +190,16 @@ impl State {
         }
     }
 
-    fn record_rule_ready(&mut self, round: Round) {
-        self.rule_ready_at_ms.entry(round).or_insert_with(|| {
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("System clock is before Unix epoch")
-                .as_millis()
-        });
+    fn record_rule_ready(&mut self, round: Round) -> Option<u128> {
+        if self.rule_ready_at_ms.contains_key(&round) {
+            return None;
+        }
+        let ready_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("System clock is before Unix epoch")
+            .as_millis();
+        self.rule_ready_at_ms.insert(round, ready_at);
+        Some(ready_at)
     }
 
     fn observe(&mut self, certificate: Certificate) -> HashSet<Round> {
@@ -1435,9 +1438,17 @@ impl Consensus {
                         );
                         let ordered = self.order_dag(&target, state);
                         state.pending_order.insert(target_round, ordered);
-                        state.pending_leaders.insert(target_round, target);
+                        state.pending_leaders.insert(target_round, target.clone());
                         state.leader_commit_rules.entry(target_round).or_insert(3);
-                        state.record_rule_ready(target_round);
+                        if let Some(_ready_at) = state.record_rule_ready(target_round) {
+                            #[cfg(feature = "benchmark")]
+                            info!(
+                                "Leader commit-ready round {} digest {:?} at {}",
+                                target_round,
+                                target.header.digest(),
+                                _ready_at
+                            );
+                        }
                         state.rule_three_stacks[(target_round % 3) as usize].insert(target_round);
                         state.wake_pending(target_round);
                     } else {
@@ -1589,7 +1600,15 @@ impl Consensus {
         // Entering pending authorizes early, verified GRBC data for the leader
         // and its complete causal history to be inserted directly into Dag.
         state.force_observed_history_to_dag(leader.clone(), round);
-        state.record_rule_ready(round);
+        if let Some(_ready_at) = state.record_rule_ready(round) {
+            #[cfg(feature = "benchmark")]
+            info!(
+                "Leader commit-ready round {} digest {:?} at {}",
+                round,
+                leader.header.digest(),
+                _ready_at
+            );
+        }
         state.leader_commit_rules.entry(round).or_insert(rule);
         let ordered = self.order_dag(&leader, state);
         #[cfg(feature = "benchmark")]
