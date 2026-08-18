@@ -7,6 +7,11 @@ set -Eeuo pipefail
 NODES="${1:-}"
 DURATION="${2:-20}"
 TOTAL_RATE="${3:-10000}"
+FAULTS="${ORCA_FAULTS:-0}"
+RULE3_BEHAVIOR="${ORCA_RULE3_BEHAVIOR:-mixed}"
+ADVERSARY_SEED="${ORCA_ADVERSARY_SEED:-0}"
+CLIENT_DURING_SILENCE="${ORCA_CLIENT_DURING_SILENCE:-send}"
+CLIENT_SILENCE_SLOT_MS="${ORCA_CLIENT_SILENCE_SLOT_MS:-}"
 
 case "$NODES" in
   10|20|50) ;;
@@ -14,6 +19,10 @@ case "$NODES" in
 esac
 [[ "$DURATION" =~ ^[1-9][0-9]*$ ]] || { echo "持续秒数必须是正整数" >&2; exit 2; }
 [[ "$TOTAL_RATE" =~ ^[1-9][0-9]*$ ]] || { echo "TPS 必须是正整数" >&2; exit 2; }
+[[ "$FAULTS" =~ ^[0-9]+$ ]] && (( FAULTS < NODES )) || { echo "ORCA_FAULTS 必须小于节点数" >&2; exit 2; }
+[[ "$ADVERSARY_SEED" =~ ^[0-9]+$ ]] || { echo "ORCA_ADVERSARY_SEED 必须是非负整数" >&2; exit 2; }
+case "$RULE3_BEHAVIOR" in mixed|silent|participate) ;; *) echo "ORCA_RULE3_BEHAVIOR 必须是 mixed、silent 或 participate" >&2; exit 2;; esac
+case "$CLIENT_DURING_SILENCE" in send|pause) ;; *) echo "ORCA_CLIENT_DURING_SILENCE 必须是 send 或 pause" >&2; exit 2;; esac
 
 REMOTE_USER="${REMOTE_USER:-ubuntu}"
 REMOTE_DIR="${REMOTE_DIR:-/home/ubuntu/Orca-A}"
@@ -44,6 +53,26 @@ done
 RATE_SHARE=$(((TOTAL_RATE + NODES - 1) / NODES))
 TX_NODES=""
 for ip in "${IPS[@]}"; do TX_NODES+="${ip}:3003 "; done
+[[ -f deploy/committee.json && -f deploy/parameters.json ]] || { echo "缺少 deploy/committee.json 或 deploy/parameters.json" >&2; exit 1; }
+KEY_FILES=()
+for ((i=0; i<NODES; i++)); do
+  [[ -f "deploy/node-${i}.json" ]] || { echo "缺少 deploy/node-${i}.json" >&2; exit 1; }
+  KEY_FILES+=("deploy/node-${i}.json")
+done
+if [[ -z "$CLIENT_SILENCE_SLOT_MS" ]]; then
+  CLIENT_SILENCE_SLOT_MS="$(python3 -c 'import json; print(json.load(open("deploy/parameters.json"))["max_header_delay"])')"
+fi
+[[ "$CLIENT_SILENCE_SLOT_MS" =~ ^[1-9][0-9]*$ ]] || { echo "ORCA_CLIENT_SILENCE_SLOT_MS 必须是正整数" >&2; exit 2; }
+mapfile -t CLIENT_SCHEDULES < <(
+  ORCA_CLIENT_DURING_SILENCE="$CLIENT_DURING_SILENCE" \
+  ORCA_RULE3_BEHAVIOR="$RULE3_BEHAVIOR" \
+  ORCA_ADVERSARY_SEED="$ADVERSARY_SEED" \
+  PYTHONPATH=benchmark python3 -m benchmark.adversary_schedule \
+    --committee deploy/committee.json --faults "$FAULTS" \
+    --duration "$DURATION" --slot-ms "$CLIENT_SILENCE_SLOT_MS" \
+    --key-files "${KEY_FILES[@]}"
+)
+[[ "${#CLIENT_SCHEDULES[@]}" -eq "$NODES" ]] || { echo "Client 静默时间表生成失败" >&2; exit 1; }
 
 remote() { ssh "${SSH_OPTS[@]}" "${REMOTE_USER}@$1" "$2"; }
 
@@ -64,7 +93,7 @@ stop_all() {
 }
 trap stop_all EXIT INT TERM
 
-echo "配置：节点=$NODES，时长=${DURATION}s，总输入=${TOTAL_RATE} TPS，每客户端=${RATE_SHARE} TPS"
+echo "配置：节点=$NODES，时长=${DURATION}s，总输入=${TOTAL_RATE} TPS，每客户端=${RATE_SHARE} TPS，敌手=$FAULTS，种子=$ADVERSARY_SEED，静默期Client=$CLIENT_DURING_SILENCE，时间槽=${CLIENT_SILENCE_SLOT_MS}ms"
 echo "[1/8] 检查 SSH、二进制、节点密钥和公共配置……"
 for i in "${!IPS[@]}"; do
   remote "${IPS[$i]}" "test -x '${REMOTE_DIR}/target/release/node' && test -x '${REMOTE_DIR}/target/release/benchmark_client' && test -f '${REMOTE_DIR}/deploy/node-${i}.json' && test -f '${REMOTE_DIR}/deploy/committee.json' && test -f '${REMOTE_DIR}/deploy/parameters.json'"
@@ -90,7 +119,7 @@ wait
 echo "[4/8] 启动 $NODES 个 Primary……"
 count=0
 for i in "${!IPS[@]}"; do
-  remote "${IPS[$i]}" "cd '${REMOTE_DIR}' && tmux new-session -d -s orca-primary \"RUST_LOG=info ./target/release/node -vv run --keys deploy/node-${i}.json --committee deploy/committee.json --parameters deploy/parameters.json --store run/db-primary primary |& tee run/logs/primary-${i}.log\"" &
+  remote "${IPS[$i]}" "cd '${REMOTE_DIR}' && tmux new-session -d -s orca-primary \"RUST_LOG=info ORCA_FAULTS='$FAULTS' ORCA_RULE3_BEHAVIOR='$RULE3_BEHAVIOR' ORCA_ADVERSARY_SEED='$ADVERSARY_SEED' ./target/release/node -vv run --keys deploy/node-${i}.json --committee deploy/committee.json --parameters deploy/parameters.json --store run/db-primary primary |& tee run/logs/primary-${i}.log\"" &
   count=$((count + 1)); wait_batch "$count"
 done
 wait
@@ -109,7 +138,11 @@ done
 echo "启动 $NODES 个 benchmark_client……"
 count=0
 for i in "${!IPS[@]}"; do
-  remote "${IPS[$i]}" "cd '${REMOTE_DIR}' && tmux new-session -d -s orca-client \"RUST_LOG=info ./target/release/benchmark_client '${IPS[$i]}:3003' --size '${TX_SIZE}' --rate '${RATE_SHARE}' --nodes ${TX_NODES} |& tee run/logs/client-${i}-0.log\"" &
+  SILENCE_ARGS=""
+  if [[ "$CLIENT_DURING_SILENCE" == "pause" ]]; then
+    SILENCE_ARGS="--silence-schedule '${CLIENT_SCHEDULES[$i]}' --silence-slot-ms '$CLIENT_SILENCE_SLOT_MS'"
+  fi
+  remote "${IPS[$i]}" "cd '${REMOTE_DIR}' && tmux new-session -d -s orca-client \"RUST_LOG=info ./target/release/benchmark_client '${IPS[$i]}:3003' --size '${TX_SIZE}' --rate '${RATE_SHARE}' $SILENCE_ARGS --nodes ${TX_NODES} |& tee run/logs/client-${i}-0.log\"" &
   count=$((count + 1)); wait_batch "$count"
 done
 wait

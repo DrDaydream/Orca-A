@@ -6,9 +6,25 @@
 
 > 重要：50 台 EC2 会产生明显费用，公网 IPv4、EBS 和跨可用区流量也可能收费。第一次务必先用 10 台、20 秒、10,000 TPS 跑通，并在测试后停止或终止实例。先在 AWS 的 Service Quotas 检查按需实例 vCPU 配额。
 
-> 最新敌手模式：benchmark 中 `faults > 0` 时不再停止最后 `f` 台服务器；所有节点继续运行，Primary 启动命令会自动传入 `ORCA_FAULTS`，并在协议内启用 Rule 1/2/3 确定性调度。因此安全组和部署脚本必须包含全部 `nodes` 台机器。
+> 最新敌手模式：benchmark 中 `faults > 0` 时不再停止最后 `f` 台服务器；所有节点继续运行。每轮根据 `ORCA_ADVERSARY_SEED`、轮次和委员会确定性伪随机选出 `f` 个敌手。若本轮 leader 被选为敌手，它会强制进入 Rule 3，不再检查 Rule 1/2；非敌手 leader 仍正常检查 Rule 1/2，未命中才进入 Rule 3。非 leader 敌手静默。静默节点不创建 Header，并暂停本地 batch 生产，但继续接收消息。默认种子为 `0`，例如 `ORCA_ADVERSARY_SEED=42 fab local` 可得到另一条可复现轨迹。因此安全组和部署脚本必须包含全部 `nodes` 台机器。
 
-Rule 3 leader 的行为可在运行 Fabric 前通过 `ORCA_RULE3_BEHAVIOR` 选择：`silent` 表示全部静默，`participate` 表示全部继续参与，`mixed`（默认）表示每个 Rule 3 leader 独立随机选择静默或参与，两种结果概率各为 1/2。例如：`ORCA_RULE3_BEHAVIOR=silent fab local`。该参数会自动传入本地或远端 Primary。
+当 `faults > 0` 时，非敌手 leader 还会通过独立的确定性随机硬币分流：约一半正常尝试 Rule 1，另一半跳过 Rule 1 等待 Rule 2，使长时间测试中的 Rule 1:Rule 2 接近 1:1。统计百分比仍以包含 Rule 3 的全部 leader 为分母，因此两项不一定各为 50%。
+
+若本轮随机敌手中包含 leader，可在运行 Fabric 前通过 `ORCA_RULE3_BEHAVIOR` 选择该强制 Rule 3 leader 的行为：`silent` 表示静默，`participate` 表示继续参与，`mixed`（默认）表示根据相同种子确定性选择静默或参与，两种结果概率各为 1/2。例如：`ORCA_RULE3_BEHAVIOR=silent fab local`。该参数会自动传入本地或远端 Primary。
+
+Client 在敌手静默时间段的行为由 `ORCA_CLIENT_DURING_SILENCE` 控制：`send`（默认）保持发送，`pause` 不发送交易。`pause` 使用 benchmark 启动前生成的单向墙钟时间表，不使用 Worker → Client 反馈。每个时间槽默认等于 `max_header_delay`，也可通过 `ORCA_CLIENT_SILENCE_SLOT_MS` 设置。例如：
+
+```bash
+# 先把 benchmark/fabfile.py 中的 faults 改为大于 0。
+ORCA_CLIENT_DURING_SILENCE=send fab local
+ORCA_CLIENT_DURING_SILENCE=pause ORCA_CLIENT_SILENCE_SLOT_MS=200 fab local
+```
+
+AWS 脚本同样读取这两个变量：
+
+```bash
+ORCA_FAULTS=1 ORCA_CLIENT_DURING_SILENCE=pause ./run-multi-servers.sh 10 20 10000
+```
 
 ## 当前代码版本与本次优化
 

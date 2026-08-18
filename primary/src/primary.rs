@@ -49,6 +49,8 @@ pub enum PrimaryWorkerMessage {
     Synchronize(Vec<Digest>, /* target */ PublicKey),
     /// The primary indicates a round update.
     Cleanup(Round),
+    /// Pause or resume local batch production for a proposer round.
+    BatchSilent(Round, bool),
 }
 
 /// The messages sent by the workers to their primary.
