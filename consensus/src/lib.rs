@@ -109,6 +109,9 @@ struct State {
     highest_advanced_round: Round,
     /// Non-blocking handoff to the single ordered cleanup/application writer.
     commit_tx: Option<mpsc::UnboundedSender<Vec<Certificate>>>,
+    /// Prevent duplicate benchmark records when a preordered DAG is revisited.
+    #[cfg(feature = "benchmark")]
+    logged_rule_order: HashMap<Digest, Round>,
 }
 
 impl State {
@@ -187,6 +190,8 @@ impl State {
             dirty_leaders: HashSet::new(),
             highest_advanced_round: 1,
             commit_tx: None,
+            #[cfg(feature = "benchmark")]
+            logged_rule_order: HashMap::new(),
         }
     }
 
@@ -557,6 +562,9 @@ impl State {
             .retain(|round, _| *round + gc_depth >= last_committed_round);
         self.deferred_rule_one
             .retain(|round, _| *round + gc_depth >= last_committed_round);
+        #[cfg(feature = "benchmark")]
+        self.logged_rule_order
+            .retain(|_, round| *round + gc_depth >= last_committed_round);
     }
 }
 
@@ -1613,7 +1621,12 @@ impl Consensus {
         let ordered = self.order_dag(&leader, state);
         #[cfg(feature = "benchmark")]
         for certificate in &ordered {
-            if certificate.origin() != self.ordering_leader_authority(certificate.round()) {
+            if certificate.origin() != self.ordering_leader_authority(certificate.round())
+                && state
+                    .logged_rule_order
+                    .insert(certificate.header.digest(), certificate.round())
+                    .is_none()
+            {
                 info!(
                     "Header rule-ordered round {} digest {:?}",
                     certificate.round(),
