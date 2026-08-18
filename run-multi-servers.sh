@@ -191,11 +191,12 @@ done
 
 echo "[8/8] 解析结果……"
 cd benchmark
-python3 - "$NODES" <<'PY'
+python3 - "$NODES" "$FAULTS" <<'PY'
 import sys
 from benchmark.logs import LogParser
 
 nodes = int(sys.argv[1])
-print(LogParser.process("logs", faults=0).result())
-print(f"Parsed {nodes} active nodes with faults=0")
+faults = int(sys.argv[2])
+print(LogParser.process("logs", faults=faults).result())
+print(f"Parsed {nodes} active nodes with faults={faults}")
 PY
