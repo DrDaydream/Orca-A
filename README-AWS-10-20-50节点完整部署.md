@@ -8,6 +8,8 @@
 
 > 最新敌手模式：benchmark 中 `faults > 0` 时不再停止最后 `f` 台服务器；所有节点继续运行，Primary 启动命令会自动传入 `ORCA_FAULTS`，并在协议内启用 Rule 1/2/3 确定性调度。因此安全组和部署脚本必须包含全部 `nodes` 台机器。
 
+Rule 3 leader 的行为可在运行 Fabric 前通过 `ORCA_RULE3_BEHAVIOR` 选择：`silent` 表示全部静默，`participate` 表示全部继续参与，`mixed`（默认）表示每个 Rule 3 leader 独立随机选择静默或参与，两种结果概率各为 1/2。例如：`ORCA_RULE3_BEHAVIOR=silent fab local`。该参数会自动传入本地或远端 Primary。
+
 ## 当前代码版本与本次优化
 
 本文适用于包含提交 `d446a42` 或更新版本的 Orca-A。该版本已包含：
