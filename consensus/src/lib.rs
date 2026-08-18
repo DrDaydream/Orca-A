@@ -82,6 +82,8 @@ struct State {
     /// Wall-clock time at which a leader first completed a commit rule. This
     /// intentionally excludes predecessor and output-channel waiting.
     rule_ready_at_ms: HashMap<Round, u128>,
+    /// First commit rule that made each leader ready (1, 2, or 3).
+    leader_commit_rules: HashMap<Round, u8>,
     /// DAG sequences prepared as soon as a leader completes a rule, while
     /// predecessor ordering continues independently.
     pending_order: HashMap<Round, Vec<Certificate>>,
@@ -170,6 +172,7 @@ impl State {
             skipped_leaders: HashSet::new(),
             pending_leaders: BTreeMap::new(),
             rule_ready_at_ms: HashMap::new(),
+            leader_commit_rules: HashMap::new(),
             pending_order: HashMap::new(),
             ready_pending: BTreeSet::new(),
             rule_three_stacks: [BTreeSet::new(), BTreeSet::new(), BTreeSet::new()],
@@ -570,6 +573,31 @@ enum OutputSender {
 }
 
 impl Consensus {
+    fn adversarial_schedule_enabled() -> bool {
+        std::env::var("ORCA_FAULTS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .map_or(false, |faults| faults > 0)
+    }
+
+    fn scheduled_rule(&self, round: Round) -> u8 {
+        if !Self::adversarial_schedule_enabled() {
+            return 0;
+        }
+        let index = round.saturating_sub(1);
+        ((index + index / 3) % 3 + 1) as u8
+    }
+
+    fn mark_rule_three_skipped(&self, round: Round, state: &mut State) {
+        if state.mark_skipped(round) {
+            #[cfg(feature = "benchmark")]
+            info!(
+                "Commit rule stats leader round-{} rule 3 outcome skip blocks 0",
+                round
+            );
+        }
+    }
+
     pub fn spawn(
         committee: Committee,
         gc_depth: Round,
@@ -883,6 +911,9 @@ impl Consensus {
             return;
         }
         let leader_round = r - 1;
+        if Self::adversarial_schedule_enabled() && self.scheduled_rule(leader_round) != 1 {
+            return;
+        }
         if state.committed_leaders.contains(&leader_round)
             || state.pending_leaders.contains_key(&leader_round)
         {
@@ -911,7 +942,7 @@ impl Consensus {
         // Rule 1 accepts the leader from any verified GRBC stage. Once the
         // quorum condition succeeds, recover it and its causal history into Dag.
         state.force_observed_history_to_dag(leader.clone(), leader_round);
-        self.queue_leader_commit(leader, state).await;
+        self.queue_leader_commit(leader, 1, state).await;
     }
 
     /// Evaluate commit rule 2 for observed round `q` and leader round `q-2`.
@@ -920,6 +951,9 @@ impl Consensus {
             return;
         }
         let leader_round = q - 2;
+        if Self::adversarial_schedule_enabled() && self.scheduled_rule(leader_round) != 2 {
+            return;
+        }
         if state.committed_leaders.contains(&leader_round)
             || state.pending_leaders.contains_key(&leader_round)
         {
@@ -970,7 +1004,7 @@ impl Consensus {
             "Leader {:?} satisfies commit rule 2: observed-strong {}, Dag-strong {}, Dag-strong-or-virtual {}",
             leader, observed_strong, dag_strong, dag_strong_or_virtual
         );
-        self.queue_leader_commit(leader, state).await;
+        self.queue_leader_commit(leader, 2, state).await;
     }
 
     /// Counts rule-2 support in round `q`, with each authority counted once.
@@ -1260,7 +1294,7 @@ impl Consensus {
                             "Skipping absent leader round {} during rule-3 backtracking",
                             target_round
                         );
-                        state.mark_skipped(target_round);
+                        self.mark_rule_three_skipped(target_round, state);
                         state.rule_three_recovery.remove(&target_round);
                         state.missing_leader_requests.remove(&target_round);
                         self.drain_ready_leaders(state).await;
@@ -1279,7 +1313,7 @@ impl Consensus {
                             "Skipping leader round {}: leader round {} history has no parents/virtual reference to its digest",
                             target_round, observer_round
                         );
-                        state.mark_skipped(target_round);
+                        self.mark_rule_three_skipped(target_round, state);
                         self.drain_ready_leaders(state).await;
                         if target_round < 4 {
                             break;
@@ -1315,7 +1349,7 @@ impl Consensus {
                                     "Skipping absent leader round {} in rule-3 chain",
                                     lower_round
                                 );
-                                state.mark_skipped(lower_round);
+                                self.mark_rule_three_skipped(lower_round, state);
                                 let target_digest = target.as_ref().unwrap().digest();
                                 if self.missing_leader_bridge(&higher, &target_digest, state) {
                                     sampled_debug!(lower_round,
@@ -1334,14 +1368,14 @@ impl Consensus {
                                     "Skipping absent leader round {} in rule-3 chain",
                                     chain_round
                                 );
-                                state.mark_skipped(chain_round);
+                                self.mark_rule_three_skipped(chain_round, state);
                                 if lower.is_none() {
                                     sampled_debug!(
                                         lower_round,
                                         "Skipping absent leader round {} in rule-3 chain",
                                         lower_round
                                     );
-                                    state.mark_skipped(lower_round);
+                                    self.mark_rule_three_skipped(lower_round, state);
                                 }
                                 false
                             }
@@ -1367,6 +1401,7 @@ impl Consensus {
                         let ordered = self.order_dag(&target, state);
                         state.pending_order.insert(target_round, ordered);
                         state.pending_leaders.insert(target_round, target);
+                        state.leader_commit_rules.entry(target_round).or_insert(3);
                         state.record_rule_ready(target_round);
                         state.rule_three_stacks[(target_round % 3) as usize].insert(target_round);
                         state.wake_pending(target_round);
@@ -1377,7 +1412,7 @@ impl Consensus {
                             target_round,
                             observer_round
                         );
-                        state.mark_skipped(target_round);
+                        self.mark_rule_three_skipped(target_round, state);
                     }
                     self.drain_ready_leaders(state).await;
                 }
@@ -1511,7 +1546,7 @@ impl Consensus {
     }
 
     /// Queue a leader once and commit ready leaders in consecutive round order.
-    async fn queue_leader_commit(&mut self, leader: Certificate, state: &mut State) {
+    async fn queue_leader_commit(&mut self, leader: Certificate, rule: u8, state: &mut State) {
         let round = leader.round();
         if state.committed_leaders.contains(&round) {
             return;
@@ -1520,7 +1555,18 @@ impl Consensus {
         // and its complete causal history to be inserted directly into Dag.
         state.force_observed_history_to_dag(leader.clone(), round);
         state.record_rule_ready(round);
+        state.leader_commit_rules.entry(round).or_insert(rule);
         let ordered = self.order_dag(&leader, state);
+        #[cfg(feature = "benchmark")]
+        for certificate in &ordered {
+            if certificate.origin() != self.ordering_leader_authority(certificate.round()) {
+                info!(
+                    "Header rule-ordered round {} digest {:?}",
+                    certificate.round(),
+                    certificate.header.digest()
+                );
+            }
+        }
         state.pending_order.insert(round, ordered);
         if let std::collections::btree_map::Entry::Vacant(entry) =
             state.pending_leaders.entry(round)
@@ -1575,6 +1621,14 @@ impl Consensus {
                     .get(&certificate.origin())
                     .map_or(true, |round| certificate.round() > *round)
             });
+            let commit_rule = state.leader_commit_rules.remove(&ready_round).unwrap_or(3);
+            #[cfg(feature = "benchmark")]
+            info!(
+                "Commit rule stats leader {:?} rule {} outcome commit blocks {}",
+                leader.header.digest(),
+                commit_rule,
+                sequence.len()
+            );
             let _rule_ready_at_ms =
                 state
                     .rule_ready_at_ms
@@ -1589,6 +1643,13 @@ impl Consensus {
             for certificate in &sequence {
                 #[cfg(not(feature = "benchmark"))]
                 info!("Committed {}", certificate.header);
+                #[cfg(feature = "benchmark")]
+                info!(
+                    "Header committed round {} digest {:?} leader {}",
+                    certificate.round(),
+                    certificate.header.digest(),
+                    certificate.origin() == self.ordering_leader_authority(certificate.round())
+                );
                 #[cfg(feature = "benchmark")]
                 for digest in certificate.header.payload.keys() {
                     info!(
