@@ -333,6 +333,7 @@ done < deploy/hosts-10.txt
 
 - `hostname contains invalid characters`：hosts 中只能有纯私网 IPv4，一行一个。
 - `ready=0/N`：检查全部 Worker 日志和 3003；一个 Worker 未启动可能使所有 Client 等待。
+- 脚本会等待每个 Worker 的 3003 最多 90 秒，全部就绪后才启动 Client；超时会自动打印对应 Worker 日志，避免跨 Region 首次启动超过固定延迟时误报 `Connection refused`。
 - `NoneType object has no attribute group`：至少一份 Client 日志没有 `Start sending transactions`，不要解析未就绪的测试。
 - `librocksdb-sys` / bindgen 报错：确认 clang-14 的五个编译环境变量完整。
 - `Malformed` / `Serialization`：各机器 Git commit 或 committee 不一致。

@@ -76,6 +76,16 @@ mapfile -t CLIENT_SCHEDULES < <(
 
 remote() { ssh "${SSH_OPTS[@]}" "${REMOTE_USER}@$1" "$2"; }
 
+wait_worker_port() {
+  local ip="$1" index="$2" timeout="${3:-90}"
+  if remote "$ip" "for n in \$(seq 1 '$timeout'); do ss -ltn | grep -q ':3003 ' && exit 0; sleep 1; done; exit 1"; then
+    return 0
+  fi
+  echo "错误：node-$index ($ip) 等待 Worker 3003 超时" >&2
+  remote "$ip" "tail -100 '${REMOTE_DIR}/run/logs/worker-${index}-0.log'" >&2 || true
+  return 1
+}
+
 # 每启动 MAX_PARALLEL 个后台任务就等待，避免 50 个 SSH 同时冲击控制机。
 wait_batch() {
   local running="$1"
@@ -123,15 +133,10 @@ for i in "${!IPS[@]}"; do
   count=$((count + 1)); wait_batch "$count"
 done
 wait
-sleep 5
 
 echo "[5/8] 检查 Worker 的 3003 端口……"
 for i in "${!IPS[@]}"; do
-  if ! remote "${IPS[$i]}" "ss -ltn | grep -q ':3003 '"; then
-    echo "错误：node-$i (${IPS[$i]}) 未监听 3003" >&2
-    remote "${IPS[$i]}" "tail -100 '${REMOTE_DIR}/run/logs/worker-${i}-0.log'" || true
-    exit 1
-  fi
+  wait_worker_port "${IPS[$i]}" "$i" 90 || exit 1
   echo "  node-$i 3003 OK"
 done
 
