@@ -176,3 +176,47 @@ sed -e 's/#.*//' -e '/^[[:space:]]*$/d' deploy/hosts-50.txt \
 - node0 无法 SSH 到自己的私网 IP：为 node0 配置本机 SSH 密钥，或确保 node0 对应的区域 PEM可以认证该实例。
 
 完成代码下载后，继续按照 [AWS 10/20/50 节点完整部署文档](README-AWS-10-20-50节点完整部署.md) 安装依赖、编译、生成配置并运行基准测试。
+
+## 9. 并行安装依赖和编译
+
+建议系统依赖使用 10 台并发，Rust 编译使用 10 到 20 台并发；`CARGO_BUILD_JOBS=2` 限制每台机器的编译线程，避免内存耗尽。
+
+~~~bash
+cd /home/ubuntu/Orca-A
+HOSTS=deploy/hosts-50.txt
+
+sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "$HOSTS" | xargs -P 10 -I {} ssh {} '
+  set -e
+  sudo apt-get update
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    build-essential clang libclang-dev cmake pkg-config libssl-dev \
+    librocksdb-dev git curl
+'
+
+sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "$HOSTS" | xargs -P 10 -I {} ssh {} '
+  if ! command -v cargo >/dev/null 2>&1; then
+    curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+  fi
+'
+
+sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "$HOSTS" | xargs -P 20 -I {} ssh {} '
+  set -e; cd /home/ubuntu/Orca-A
+  . "$HOME/.cargo/env" 2>/dev/null || true
+  cargo fetch
+'
+
+sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "$HOSTS" | xargs -P 10 -I {} ssh {} '
+  set -e; cd /home/ubuntu/Orca-A
+  . "$HOME/.cargo/env" 2>/dev/null || true
+  CARGO_BUILD_JOBS=2 cargo build --quiet --release --features benchmark
+'
+~~~
+
+检查编译结果：
+
+~~~bash
+sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "$HOSTS" | xargs -P 50 -I {} ssh {} '
+  printf "%s: " "$(hostname)"
+  test -x /home/ubuntu/Orca-A/target/release/node && echo "build ok" || echo "build failed"
+'
+~~~
