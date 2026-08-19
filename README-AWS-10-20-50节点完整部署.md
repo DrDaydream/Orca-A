@@ -219,7 +219,7 @@ Path("deploy/parameters.json").write_text(json.dumps({
     "max_header_delay": 1000,
     "gc_depth": 50,
     "sync_retry_delay": 10000,
-    "sync_retry_nodes": 17,
+    "sync_retry_nodes": 3,
     "batch_size": 500000,
     "max_batch_delay": 1000,
 }, indent=4))
