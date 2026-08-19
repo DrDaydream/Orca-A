@@ -173,8 +173,8 @@ done < deploy/hosts-10.txt
 
 ~~~bash
 cd ~/Orca-A
-NODES=50
-HOSTS_FILE=deploy/hosts-50.txt
+NODES=10
+HOSTS_FILE=deploy/hosts-10.txt
 rm -f deploy/node-*.json deploy/committee.json deploy/parameters.json
 for ((i=0; i<NODES; i++)); do
   ./target/release/node generate_keys --filename "deploy/node-$i.json"
@@ -216,12 +216,12 @@ Path("deploy/committee.json").write_text(
 )
 Path("deploy/parameters.json").write_text(json.dumps({
     "header_size": 1000,
-    "max_header_delay": 3000,
+    "max_header_delay": 1000,
     "gc_depth": 50,
-    "sync_retry_delay": 3000,
-    "sync_retry_nodes": 17,
+    "sync_retry_delay": 10000,
+    "sync_retry_nodes": 3,
     "batch_size": 500000,
-    "max_batch_delay": 3000,
+    "max_batch_delay": 1000,
 }, indent=4))
 PY
 
