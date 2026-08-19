@@ -129,10 +129,10 @@ sed -e 's/#.*//' -e '/^[[:space:]]*$/d' deploy/hosts-50.txt \
 ~~~bash
 sed -e 's/#.*//' -e '/^[[:space:]]*$/d' deploy/hosts-50.txt \
   | xargs -P 50 -I {} ssh {} \
-    'if [ -d /home/ubuntu/Orca-A/.git ]; then
-         git -C /home/ubuntu/Orca-A pull --ff-only;
-     elif [ -e /home/ubuntu/Orca-A ]; then
-         echo "ERROR: /home/ubuntu/Orca-A exists but is not a Git repository" >&2;
+    'if [ -d ~/Orca-A/.git ]; then
+         git -C ~/Orca-A pull --ff-only;
+     elif [ -e ~u/Orca-A ]; then
+         echo "ERROR: ~/Orca-A exists but is not a Git repository" >&2;
          exit 1;
      else
          git clone https://github.com/DrDaydream/Orca-A.git /home/ubuntu/Orca-A;
@@ -144,8 +144,8 @@ sed -e 's/#.*//' -e '/^[[:space:]]*$/d' deploy/hosts-50.txt \
 ~~~bash
 sed -e 's/#.*//' -e '/^[[:space:]]*$/d' deploy/hosts-50.txt \
   | xargs -P 10 -I {} ssh {} \
-    'if [ -d /home/ubuntu/Orca-A/.git ]; then
-         git -C /home/ubuntu/Orca-A pull --ff-only;
+    'if [ -d ~/Orca-A/.git ]; then
+         git -C ~/Orca-A pull --ff-only;
      else
          git clone https://github.com/DrDaydream/Orca-A.git /home/ubuntu/Orca-A;
      fi'
@@ -156,7 +156,7 @@ sed -e 's/#.*//' -e '/^[[:space:]]*$/d' deploy/hosts-50.txt \
 ~~~bash
 sed -e 's/#.*//' -e '/^[[:space:]]*$/d' deploy/hosts-50.txt \
   | xargs -P 50 -I {} ssh {} \
-    'printf "%s: " "$(hostname)"; git -C /home/ubuntu/Orca-A rev-parse --short HEAD'
+    'printf "%s: " "$(hostname)"; git -C ~/Orca-A rev-parse --short HEAD'
 ~~~
 
 所有节点应输出相同的提交号。也可以检查远程仓库地址和分支：
@@ -164,7 +164,7 @@ sed -e 's/#.*//' -e '/^[[:space:]]*$/d' deploy/hosts-50.txt \
 ~~~bash
 sed -e 's/#.*//' -e '/^[[:space:]]*$/d' deploy/hosts-50.txt \
   | xargs -P 50 -I {} ssh {} \
-    'printf "%s: " "$(hostname)"; git -C /home/ubuntu/Orca-A remote get-url origin; git -C /home/ubuntu/Orca-A branch --show-current'
+    'printf "%s: " "$(hostname)"; git -C ~/Orca-A remote get-url origin; git -C ~/Orca-A branch --show-current'
 ~~~
 
 ## 8. 常见错误
@@ -182,7 +182,7 @@ sed -e 's/#.*//' -e '/^[[:space:]]*$/d' deploy/hosts-50.txt \
 建议系统依赖使用 10 台并发，Rust 编译使用 10 到 20 台并发；`CARGO_BUILD_JOBS=2` 限制每台机器的编译线程，避免内存耗尽。
 
 ~~~bash
-cd /home/ubuntu/Orca-A
+cd ~/Orca-A
 HOSTS=deploy/hosts-50.txt
 
 sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "$HOSTS" | xargs -P 10 -I {} ssh {} '
@@ -200,13 +200,13 @@ sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "$HOSTS" | xargs -P 10 -I {} ssh {} '
 '
 
 sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "$HOSTS" | xargs -P 20 -I {} ssh {} '
-  set -e; cd /home/ubuntu/Orca-A
+  set -e; cd ~/Orca-A
   . "$HOME/.cargo/env" 2>/dev/null || true
   cargo fetch
 '
 
 sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "$HOSTS" | xargs -P 10 -I {} ssh {} '
-  set -e; cd /home/ubuntu/Orca-A
+  set -e; cd ~/Orca-A
   . "$HOME/.cargo/env" 2>/dev/null || true
   CARGO_BUILD_JOBS=2 cargo build --quiet --release --features benchmark
 '
@@ -217,6 +217,6 @@ sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "$HOSTS" | xargs -P 10 -I {} ssh {} '
 ~~~bash
 sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "$HOSTS" | xargs -P 50 -I {} ssh {} '
   printf "%s: " "$(hostname)"
-  test -x /home/ubuntu/Orca-A/target/release/node && echo "build ok" || echo "build failed"
+  test -x ~/Orca-A/target/release/node && echo "build ok" || echo "build failed"
 '
 ~~~
