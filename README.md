@@ -219,6 +219,7 @@ For comparison, this is the previously recorded 4-node, 1-fault, 20-second local
 - See [benchmark/README.md](benchmark/README.md) for benchmark parameters and log interpretation.
 - See [README-AWS-10-20-50节点完整部署.md](README-AWS-10-20-50节点完整部署.md) for complete AWS 10/20/50-node deployment, cross-Region networking, and adversary examples.
 - See [README-WINDOWS五区域PEM部署.md](README-WINDOWS五区域PEM部署.md) when a Windows computer controls five AWS Regions using one PEM per Region.
+- See [README-50节点并行下载.md](README-50节点并行下载.md) to download or update Orca-A concurrently on 50 servers through node0.
 - Inspect the [primary](primary), [worker](worker), and [consensus](consensus) crates for protocol implementation details.
 
 ## License
