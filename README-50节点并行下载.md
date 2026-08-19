@@ -181,6 +181,8 @@ sed -e 's/#.*//' -e '/^[[:space:]]*$/d' deploy/hosts-50.txt \
 
 建议系统依赖使用 10 台并发，Rust 编译使用 10 到 20 台并发；`CARGO_BUILD_JOBS=2` 限制每台机器的编译线程，避免内存耗尽。
 
+APT 软件包、Rust 工具链和 `~/.cargo` 下载缓存属于系统或 `ubuntu` 用户，不属于 Orca-A 仓库。所有节点通过本节成功安装一次后，Orca-B、Bullshark 和 Tusk 不需要重复安装，只需进入各自目录并编译；每个项目的 `target/release` 仍然相互独立。
+
 ~~~bash
 cd ~/Orca-A
 HOSTS=deploy/hosts-50.txt
