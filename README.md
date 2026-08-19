@@ -218,6 +218,7 @@ For comparison, this is the previously recorded 4-node, 1-fault, 20-second local
 - Read [Narwhal and Tusk: A DAG-based Mempool and Efficient BFT Consensus](https://arxiv.org/pdf/2105.11827.pdf).
 - See [benchmark/README.md](benchmark/README.md) for benchmark parameters and log interpretation.
 - See [README-AWS-10-20-50节点完整部署.md](README-AWS-10-20-50节点完整部署.md) for complete AWS 10/20/50-node deployment, cross-Region networking, and adversary examples.
+- See [README-WINDOWS五区域PEM部署.md](README-WINDOWS五区域PEM部署.md) when a Windows computer controls five AWS Regions using one PEM per Region.
 - Inspect the [primary](primary), [worker](worker), and [consensus](consensus) crates for protocol implementation details.
 
 ## License

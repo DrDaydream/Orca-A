@@ -24,11 +24,11 @@ esac
 case "$RULE3_BEHAVIOR" in mixed|silent|participate) ;; *) echo "ORCA_RULE3_BEHAVIOR 必须是 mixed、silent 或 participate" >&2; exit 2;; esac
 case "$CLIENT_DURING_SILENCE" in send|pause) ;; *) echo "ORCA_CLIENT_DURING_SILENCE 必须是 send 或 pause" >&2; exit 2;; esac
 
-REMOTE_USER="${REMOTE_USER:-root}"
-REMOTE_DIR="${REMOTE_DIR:-/root/Orca-A}"
+REMOTE_USER="${REMOTE_USER:-ubuntu}"
+REMOTE_DIR="${REMOTE_DIR:-/home/ubuntu/Orca-A}"
 DEFAULT_HOSTS="deploy/hosts-${NODES}.txt"
-[[ -f "/root/orca-deploy/hosts-${NODES}.txt" ]] \
-  && DEFAULT_HOSTS="/root/orca-deploy/hosts-${NODES}.txt"
+[[ -f "/home/ubuntu/orca-deploy/hosts-${NODES}.txt" ]] \
+  && DEFAULT_HOSTS="/home/ubuntu/orca-deploy/hosts-${NODES}.txt"
 HOSTS_FILE="${HOSTS_FILE:-$DEFAULT_HOSTS}"
 MAX_PARALLEL="${MAX_PARALLEL:-10}"
 READY_TIMEOUT="${READY_TIMEOUT:-180}"
