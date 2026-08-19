@@ -8,7 +8,7 @@
 - `node0` 同时是协议节点和集群控制机；
 - 所有 Linux 服务器的用户为 `ubuntu`；
 - 五个 AWS Region 分别使用对应的 PEM；
-- `node0` 已通过 `/home/ubuntu/.ssh/config` 配置各区域的 SSH 密钥；
+- `node0` 已通过 `~/.ssh/config` 配置各区域的 SSH 密钥；
 - 节点之间使用跨 Region 私网互联后可达的 Private IPv4。
 
 PEM 是敏感文件，禁止加入仓库或上传到 GitHub。
@@ -34,27 +34,27 @@ ssh NODE0_PUBLIC_IP
 ~~~sshconfig
 Host 10.10.*
     User ubuntu
-    IdentityFile /home/ubuntu/.ssh/us-east-1.pem
+    IdentityFile ~/.ssh/us-east-1.pem
     IdentitiesOnly yes
 
 Host 10.20.*
     User ubuntu
-    IdentityFile /home/ubuntu/.ssh/sa-east-1.pem
+    IdentityFile ~/.ssh/sa-east-1.pem
     IdentitiesOnly yes
 
 Host 10.30.*
     User ubuntu
-    IdentityFile /home/ubuntu/.ssh/eu-west-2.pem
+    IdentityFile ~/.ssh/eu-west-2.pem
     IdentitiesOnly yes
 
 Host 10.40.*
     User ubuntu
-    IdentityFile /home/ubuntu/.ssh/ap-southeast-1.pem
+    IdentityFile ~/.ssh/ap-southeast-1.pem
     IdentitiesOnly yes
 
 Host 10.50.*
     User ubuntu
-    IdentityFile /home/ubuntu/.ssh/ap-southeast-2.pem
+    IdentityFile ~/.ssh/ap-southeast-2.pem
     IdentitiesOnly yes
 
 Host 10.*
@@ -68,9 +68,9 @@ Host 10.*
 设置权限：
 
 ~~~bash
-chmod 700 /home/ubuntu/.ssh
-chmod 600 /home/ubuntu/.ssh/config
-chmod 400 /home/ubuntu/.ssh/*.pem
+chmod 700 ~/.ssh
+chmod 600 ~/.ssh/config
+chmod 400 ~/.ssh/*.pem
 ~~~
 
 检查某个地址实际使用的用户和密钥：
@@ -87,8 +87,8 @@ ssh 10.10.1.20 hostname
 在 node0 上执行：
 
 ~~~bash
-git clone https://github.com/DrDaydream/Orca-A.git /home/ubuntu/Orca-A
-cd /home/ubuntu/Orca-A
+git clone https://github.com/DrDaydream/Orca-A.git ~/Orca-A
+cd ~/Orca-A
 cp deploy/hosts-50.txt.example deploy/hosts-50.txt
 nano deploy/hosts-50.txt
 ~~~
@@ -107,7 +107,7 @@ sed -e 's/#.*//' -e '/^[[:space:]]*$/d' deploy/hosts-50.txt \
 ## 4. 并行检查 SSH
 
 ~~~bash
-cd /home/ubuntu/Orca-A
+cd ~/Orca-A
 sed -e 's/#.*//' -e '/^[[:space:]]*$/d' deploy/hosts-50.txt \
   | xargs -P 50 -I {} ssh {} 'printf "%s: connected\n" "$(hostname)"'
 ~~~
@@ -131,11 +131,11 @@ sed -e 's/#.*//' -e '/^[[:space:]]*$/d' deploy/hosts-50.txt \
   | xargs -P 50 -I {} ssh {} \
     'if [ -d ~/Orca-A/.git ]; then
          git -C ~/Orca-A pull --ff-only;
-     elif [ -e ~u/Orca-A ]; then
+     elif [ -e ~/Orca-A ]; then
          echo "ERROR: ~/Orca-A exists but is not a Git repository" >&2;
          exit 1;
      else
-         git clone https://github.com/DrDaydream/Orca-A.git /home/ubuntu/Orca-A;
+         git clone https://github.com/DrDaydream/Orca-A.git ~/Orca-A;
      fi'
 ~~~
 
@@ -147,7 +147,7 @@ sed -e 's/#.*//' -e '/^[[:space:]]*$/d' deploy/hosts-50.txt \
     'if [ -d ~/Orca-A/.git ]; then
          git -C ~/Orca-A pull --ff-only;
      else
-         git clone https://github.com/DrDaydream/Orca-A.git /home/ubuntu/Orca-A;
+         git clone https://github.com/DrDaydream/Orca-A.git ~/Orca-A;
      fi'
 ~~~
 
