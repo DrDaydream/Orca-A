@@ -221,7 +221,7 @@ Path("deploy/parameters.json").write_text(json.dumps({
     "sync_retry_delay": 10000,
     "sync_retry_nodes": 3,
     "batch_size": 500000,
-    "max_batch_delay": 200,
+    "max_batch_delay": 3000,
 }, indent=4))
 PY
 
