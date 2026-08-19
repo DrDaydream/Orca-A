@@ -55,7 +55,7 @@ ap-southeast-2.pem
 ~~~powershell
 $Node0Pem = "C:\Users\YOUR_NAME\Downloads\eu-west-2.pem"
 $PemDir = "C:\Users\YOUR_NAME\Downloads"
-
+scp -i C:\keys\node0.pem C:\keys\region-*.pem ubuntu@NODE0_PUBLIC_IP:/home/ubuntu/.ssh/
 ssh -i $Node0Pem ubuntu@NODE0_PUBLIC_IP "mkdir -p /home/ubuntu/.ssh && chmod 700 /home/ubuntu/.ssh"
 scp -i $Node0Pem "$PemDir\us-east-1.pem" ubuntu@NODE0_PUBLIC_IP:/home/ubuntu/.ssh/
 scp -i $Node0Pem "$PemDir\sa-east-1.pem" ubuntu@NODE0_PUBLIC_IP:/home/ubuntu/.ssh/
