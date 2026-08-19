@@ -173,8 +173,8 @@ done < deploy/hosts-10.txt
 
 ~~~bash
 cd ~/Orca-A
-NODES=10
-HOSTS_FILE=deploy/hosts-10.txt
+NODES=50
+HOSTS_FILE=deploy/hosts-50.txt
 rm -f deploy/node-*.json deploy/committee.json deploy/parameters.json
 for ((i=0; i<NODES; i++)); do
   ./target/release/node generate_keys --filename "deploy/node-$i.json"
