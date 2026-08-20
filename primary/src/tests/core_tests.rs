@@ -3,7 +3,6 @@ use super::*;
 use crate::common::{
     certificate, committee, committee_with_base_port, header, headers, keys, listener, votes,
 };
-use futures::future::try_join_all;
 use std::fs;
 use tokio::sync::mpsc::channel;
 
@@ -32,7 +31,7 @@ async fn process_header() {
     let mut store = Store::new(path).unwrap();
 
     // Make the vote we expect to receive.
-    let expected = Vote::new(&header(), &name, &mut signature_service).await;
+    let expected = GradeOneVote::new(&header(), &name, &mut signature_service).await;
 
     // Spawn a listener to receive the vote.
     let address = committee
@@ -77,7 +76,7 @@ async fn process_header() {
     // Ensure the listener correctly received the vote.
     let received = handle.await.unwrap();
     match bincode::deserialize(&received).unwrap() {
-        PrimaryMessage::Vote(x) => assert_eq!(x, expected),
+        PrimaryMessage::GradeOneVote(x) => assert_eq!(x, expected),
         x => panic!("Unexpected message: {:?}", x),
     }
 
@@ -227,7 +226,7 @@ async fn process_votes() {
     let (_tx_headers_loopback, rx_headers_loopback) = channel(1);
     let (_tx_certificates_loopback, rx_certificates_loopback) = channel(1);
     let (_tx_headers, rx_headers) = channel(1);
-    let (tx_consensus, _rx_consensus) = channel(1);
+    let (tx_consensus, mut rx_consensus) = channel(10);
     let (_tx_consensus_commands, rx_consensus_commands) = channel(1);
     let (tx_parents, _rx_parents) = channel(1);
 
@@ -263,29 +262,38 @@ async fn process_votes() {
         /* tx_proposer */ tx_parents,
     );
 
-    // Make the certificate we expect to receive.
-    let expected = certificate(&Header::default());
-
-    // Spawn all listeners to receive our newly formed certificate.
-    let handles: Vec<_> = committee
-        .others_primaries(&name)
-        .iter()
-        .map(|(_, address)| listener(address.primary_to_primary))
-        .collect();
-
-    // Send a votes to the core.
-    for vote in votes(&Header::default()) {
+    let header = header();
+    let expected = certificate(&header);
+    tx_primary_messages
+        .send(PrimaryMessage::Header(header.clone()))
+        .await
+        .unwrap();
+    for vote in votes(&header)
+        .into_iter()
+        .filter(|vote| vote.author != name)
+    {
         tx_primary_messages
-            .send(PrimaryMessage::Vote(vote))
+            .send(PrimaryMessage::GradeOneVote(vote))
             .await
             .unwrap();
     }
 
-    // Ensure all listeners got the certificate.
-    for received in try_join_all(handles).await.unwrap() {
-        match bincode::deserialize(&received).unwrap() {
-            PrimaryMessage::Certificate(x) => assert_eq!(x, expected),
-            x => panic!("Unexpected message: {:?}", x),
+    let mut saw_grade_one = false;
+    loop {
+        match rx_consensus.recv().await.unwrap() {
+            ConsensusMessage::Observed(observed) => assert_eq!(observed.id, header.id),
+            ConsensusMessage::GradeOne(certificate) => {
+                assert_eq!(certificate.header.id, header.id);
+                assert_eq!(certificate.votes.len(), 1);
+                saw_grade_one = true;
+            }
+            ConsensusMessage::GradeTwo(certificate) => {
+                assert!(saw_grade_one);
+                assert_eq!(certificate, expected);
+                certificate.verify(&committee).unwrap();
+                break;
+            }
+            ConsensusMessage::RoundAdvanced(_) => (),
         }
     }
 }
@@ -303,7 +311,7 @@ async fn process_certificates() {
     let (_tx_headers, rx_headers) = channel(1);
     let (tx_consensus, mut rx_consensus) = channel(6);
     let (_tx_consensus_commands, rx_consensus_commands) = channel(1);
-    let (tx_parents, mut rx_parents) = channel(1);
+    let (tx_parents, _rx_parents) = channel(1);
 
     // Create a new test store.
     let path = ".db_test_process_certificates";
@@ -351,22 +359,31 @@ async fn process_certificates() {
             .unwrap();
     }
 
-    // Grade-1 certificates stay in VDag and do not advance the proposer.
-    assert!(rx_parents.try_recv().is_err());
-
-    // Ensure the core sends the certificates to the consensus.
-    for x in certificates.clone() {
+    let expected_ids: HashSet<_> = certificates.iter().map(|x| x.header.id.clone()).collect();
+    let mut observed = HashSet::new();
+    let mut grade_one = HashSet::new();
+    let mut grade_two = HashSet::new();
+    while grade_two.len() < certificates.len() {
         match rx_consensus.recv().await.unwrap() {
-            ConsensusMessage::Observed(header) => assert_eq!(header.id, x.header.id),
-            message => panic!("unexpected first delivery: {:?}", message),
-        }
-        match rx_consensus.recv().await.unwrap() {
-            ConsensusMessage::GradeOne(certificate) => assert_eq!(certificate, x),
-            ConsensusMessage::GradeTwo(_) => panic!("unexpected grade-2 delivery"),
-            ConsensusMessage::RoundAdvanced(_) => panic!("unexpected round advancement"),
-            ConsensusMessage::Observed(_) => panic!("duplicate observation"),
+            ConsensusMessage::Observed(header) => {
+                assert!(expected_ids.contains(&header.id));
+                observed.insert(header.id);
+            }
+            ConsensusMessage::GradeOne(certificate) => {
+                assert!(expected_ids.contains(&certificate.header.id));
+                assert_eq!(certificate.votes.len(), 1);
+                grade_one.insert(certificate.header.id);
+            }
+            ConsensusMessage::GradeTwo(certificate) => {
+                assert!(grade_one.contains(&certificate.header.id));
+                certificate.verify(&committee()).unwrap();
+                grade_two.insert(certificate.header.id);
+            }
+            ConsensusMessage::RoundAdvanced(_) => (),
         }
     }
+    assert_eq!(observed, expected_ids);
+    assert_eq!(grade_one, expected_ids);
 
     // Ensure the certificates are stored.
     for x in &certificates {

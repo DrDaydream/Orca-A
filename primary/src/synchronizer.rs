@@ -171,7 +171,7 @@ impl Synchronizer {
     /// Check whether we have all the ancestors of the certificate. If we don't, send the certificate to
     /// the `CertificateWaiter` which will trigger re-processing once we have all the missing data.
     pub async fn deliver_certificate(&mut self, certificate: &Certificate) -> DagResult<bool> {
-        // Grade-1/READY acceptance only depends on the strong causal parents.
+        // Grade-1 acceptance only depends on the strong causal parents.
         // Weak dependencies are checked separately before Grade-2 contributes
         // to the strong-parent quorum and advances the local round.
         for digest in &certificate.header.parents {
