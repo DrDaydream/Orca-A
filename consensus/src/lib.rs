@@ -1900,17 +1900,10 @@ impl Consensus {
         while let Some(x) = buffer.pop() {
             sampled_debug!(x.round(), "Sequencing {:?}", x);
             ordered.push(x.clone());
-            // Strong, weak, and virtual references all belong to the causal
-            // history authorized by the committed leader. Commit readiness
-            // force-admits verified virtual ancestors into `dag_by_digest`, so
-            // the same traversal safely orders all three edge classes.
-            for parent in x
-                .header
-                .parents
-                .iter()
-                .chain(&x.header.weak_edges)
-                .chain(&x.header.virtual_edges)
-            {
+            // Final ordering follows only strong and weak causal history.
+            // Virtual edges remain protocol metadata and do not pull blocks
+            // into the ordered output.
+            for parent in x.header.parents.iter().chain(&x.header.weak_edges) {
                 let certificate = match state.dag_by_digest.get(parent) {
                     Some(certificate) => certificate,
                     None => continue, // We already ordered or GC up to here.
