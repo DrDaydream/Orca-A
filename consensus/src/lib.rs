@@ -103,7 +103,7 @@ struct State {
     /// Earliest rule-ready time for every preordered non-leader header.
     #[cfg(feature = "benchmark")]
     rule_order_ready_at: HashMap<Digest, u128>,
-    /// First commit rule that made each leader ready (1, 2, or 3).
+    /// The single terminal rule selected for each leader (1, 2, or 3).
     leader_commit_rules: HashMap<Round, u8>,
     /// DAG sequences prepared as soon as a leader completes a rule, while
     /// predecessor ordering continues independently.
@@ -780,6 +780,8 @@ impl State {
             anchors.retain(|round| keep_anchor(round));
             !anchors.is_empty()
         });
+        self.leader_commit_rules
+            .retain(|round, _| *round + gc_depth >= last_committed_round);
         #[cfg(feature = "benchmark")]
         self.rule_order_ready_at
             .retain(|digest, _| observed_digests.contains(digest));
@@ -851,11 +853,17 @@ impl Consensus {
     }
 
     fn mark_rule_three_skipped(&self, round: Round, state: &mut State) {
+        if state.leader_commit_rules.contains_key(&round)
+            || state.committed_leaders.contains(&round)
+        {
+            return;
+        }
         state.rule_three_stacks[(round % 3) as usize].remove(&round);
         state.rule_three_recovery.remove(&round);
         state.missing_leader_requests.remove(&round);
         state.dirty_leaders.remove(&round);
         if state.mark_skipped(round) {
+            state.leader_commit_rules.insert(round, 3);
             #[cfg(feature = "benchmark")]
             {
                 let decided_at = SystemTime::now()
@@ -1132,6 +1140,7 @@ impl Consensus {
                 let fallback_round = round - 3;
                 if !state.committed_leaders.contains(&fallback_round)
                     && !state.skipped_leaders.contains(&fallback_round)
+                    && !state.leader_commit_rules.contains_key(&fallback_round)
                     && !state.pending_leaders.contains_key(&fallback_round)
                 {
                     let lane = (fallback_round % 3) as usize;
@@ -1214,6 +1223,7 @@ impl Consensus {
         }
         if state.committed_leaders.contains(&leader_round)
             || state.skipped_leaders.contains(&leader_round)
+            || state.leader_commit_rules.contains_key(&leader_round)
             || state.pending_leaders.contains_key(&leader_round)
         {
             return;
@@ -1255,6 +1265,7 @@ impl Consensus {
         }
         if state.committed_leaders.contains(&leader_round)
             || state.skipped_leaders.contains(&leader_round)
+            || state.leader_commit_rules.contains_key(&leader_round)
             || state.pending_leaders.contains_key(&leader_round)
         {
             return;
@@ -1546,12 +1557,19 @@ impl Consensus {
 
     fn stage_leader_commit(&self, leader: Certificate, rule: u8, state: &mut State) {
         let round = leader.round();
+        if state.committed_leaders.contains(&round)
+            || state.skipped_leaders.contains(&round)
+            || state.pending_leaders.contains_key(&round)
+            || state.leader_commit_rules.contains_key(&round)
+        {
+            return;
+        }
+        state.leader_commit_rules.insert(round, rule);
         state.force_observed_history_to_dag(leader.clone(), round);
         state.rule_three_stacks[(round % 3) as usize].remove(&round);
         state.rule_three_recovery.remove(&round);
         state.missing_leader_requests.remove(&round);
         let _ = state.record_rule_ready(round);
-        state.leader_commit_rules.entry(round).or_insert(rule);
         let ordered = self.order_dag(&leader, state);
         #[cfg(feature = "benchmark")]
         {
@@ -1584,6 +1602,7 @@ impl Consensus {
         while candidate > 0 {
             if !state.committed_leaders.contains(&candidate)
                 && !state.skipped_leaders.contains(&candidate)
+                && !state.leader_commit_rules.contains_key(&candidate)
                 && !state.pending_leaders.contains_key(&candidate)
             {
                 state.rule_three_stacks[lane].insert(candidate);
@@ -1605,6 +1624,7 @@ impl Consensus {
             };
             if state.committed_leaders.contains(&target_round)
                 || state.skipped_leaders.contains(&target_round)
+                || state.leader_commit_rules.contains_key(&target_round)
                 || state.pending_leaders.contains_key(&target_round)
             {
                 state.rule_three_stacks[lane].remove(&target_round);
@@ -1705,6 +1725,7 @@ impl Consensus {
             for leader_round in dirty {
                 if !state.committed_leaders.contains(&leader_round)
                     && !state.skipped_leaders.contains(&leader_round)
+                    && !state.leader_commit_rules.contains_key(&leader_round)
                     && !state.pending_leaders.contains_key(&leader_round)
                 {
                     self.evaluate_commit_rule_one(leader_round + 1, state).await;
@@ -1837,7 +1858,10 @@ impl Consensus {
     /// Queue a leader once and commit ready leaders in consecutive round order.
     async fn queue_leader_commit(&mut self, leader: Certificate, rule: u8, state: &mut State) {
         let round = leader.round();
-        if state.committed_leaders.contains(&round) || state.skipped_leaders.contains(&round) {
+        if state.committed_leaders.contains(&round)
+            || state.skipped_leaders.contains(&round)
+            || state.leader_commit_rules.contains_key(&round)
+        {
             return;
         }
         // A Good/Deferred leader is the only valid initial recovery anchor.
@@ -1851,6 +1875,13 @@ impl Consensus {
             let anchor_round = state.rule_three_anchors[lane].unwrap_or(round);
             state.mark_fallback_anchor_dirty(anchor_round);
             self.evaluate_dirty_fallback_anchors(state).await;
+        }
+        if state.committed_leaders.contains(&round)
+            || state.skipped_leaders.contains(&round)
+            || state.pending_leaders.contains_key(&round)
+            || state.leader_commit_rules.contains_key(&round)
+        {
+            return;
         }
         self.stage_leader_commit(leader, rule, state);
         self.drain_ready_leaders(state).await;
