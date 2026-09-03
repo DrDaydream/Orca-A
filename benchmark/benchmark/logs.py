@@ -44,13 +44,12 @@ class LogParser:
                 results = p.map(self._parse_primaries, primaries)
         except (ValueError, IndexError, AttributeError) as e:
             raise ParseError(f'Failed to parse nodes\' logs: {e}')
-        proposals, commits, header_proposals, header_commits, leader_ready, rule_orders, commit_rules, self.configs, primary_ips = zip(*results)
+        proposals, commits, header_proposals, header_commits, leader_ready, commit_rules, self.configs, primary_ips = zip(*results)
         self.proposals = self._merge_results([x.items() for x in proposals])
         self.commits = self._merge_results([x.items() for x in commits])
         self.header_proposals = self._merge_results([x.items() for x in header_proposals])
         self.header_commits = self._merge_tagged_results(header_commits)
         self.leader_ready = self._merge_results([x.items() for x in leader_ready])
-        self.rule_orders = self._merge_results([x.items() for x in rule_orders])
         self.commit_rules = self._merge_commit_rules(commit_rules)
 
         # Parse the workers logs.
@@ -140,8 +139,6 @@ class LogParser:
         header_commits = {d: (self._to_posix(t), leader == 'true') for t, d, leader in tmp}
         tmp = findall(r'Leader commit-ready round \d+ digest (\S+) at (\d+)', log)
         leader_ready = {d: int(t) / 1_000 for d, t in tmp}
-        tmp = findall(r'\[(.*Z) .* Header rule-ordered round \d+ digest (\S+)', log)
-        rule_orders = self._merge_results([[(d, self._to_posix(t)) for t, d in tmp]])
         tmp = findall(r'Commit rule stats leader (\S+) rule ([123]) outcome (commit|skip) blocks (\d+)', log)
         commit_rules = {leader: (int(rule), outcome, int(blocks)) for leader, rule, outcome, blocks in tmp}
 
@@ -171,7 +168,7 @@ class LogParser:
 
         ip = search(r'booted on (\d+.\d+.\d+.\d+)', log).group(1)
         
-        return proposals, commits, header_proposals, header_commits, leader_ready, rule_orders, commit_rules, configs, ip
+        return proposals, commits, header_proposals, header_commits, leader_ready, commit_rules, configs, ip
 
     def _parse_workers(self, log):
         if search(r'(?:panic|Error)', log) is not None:
@@ -242,11 +239,10 @@ class LogParser:
             for digest, ready in self.leader_ready.items()
             if digest in self.header_proposals
         ]
-        rule_order = [t - self.header_proposals[d] for d, t in self.rule_orders.items() if d in self.header_proposals]
         leader_times.sort()
         intervals = [b - a for a, b in zip(leader_times, leader_times[1:])]
         avg = lambda values: mean(values) if values else 0
-        return avg(leaders), avg(non_leaders), avg(all_headers), avg(intervals), avg(rule_order)
+        return avg(leaders), avg(non_leaders), avg(all_headers), avg(intervals)
 
     def _commit_rule_ratios(self):
         leader_total = len(self.commit_rules)
@@ -273,7 +269,7 @@ class LogParser:
         consensus_tps, consensus_bps, _ = self._consensus_throughput()
         end_to_end_tps, end_to_end_bps, duration = self._end_to_end_throughput()
         end_to_end_latency = self._end_to_end_latency() * 1_000
-        leader_latency, non_leader_latency, all_header_latency, leader_interval, rule_order_latency = (x * 1_000 for x in self._header_latency_stats())
+        leader_latency, non_leader_latency, all_header_latency, leader_interval = (x * 1_000 for x in self._header_latency_stats())
         rule_leaders, rule_blocks = self._commit_rule_ratios()
 
         return (
@@ -306,7 +302,6 @@ class LogParser:
             f' Non-leader commit latency: {round(non_leader_latency):,} ms\n'
             f' All committed headers latency: {round(all_header_latency):,} ms\n'
             f' Leader commit interval: {round(leader_interval):,} ms\n'
-            f' Non-leader rule-order latency: {round(rule_order_latency):,} ms\n'
             f' Rule 1 leader ratio: {rule_leaders[0]:.2f}%\n'
             f' Rule 2 leader ratio: {rule_leaders[1]:.2f}%\n'
             f' Rule 3 commit leader ratio: {rule_leaders[2]:.2f}%\n'

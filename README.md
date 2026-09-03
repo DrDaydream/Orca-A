@@ -148,7 +148,6 @@ The following output was produced by a 4-node, 50,000 tx/s, 20-second local run:
  Non-leader commit latency: 572 ms
  All committed headers latency: 505 ms
  Leader commit interval: 192 ms
- Non-leader rule-order latency: 453 ms
  Rule 1 leader ratio: 80.00%
  Rule 2 leader ratio: 8.18%
  Rule 3 commit leader ratio: 0.00%
@@ -196,7 +195,6 @@ For comparison, this is the previously recorded 4-node, 1-fault, 20-second local
  Non-leader commit latency: 785 ms
  All committed headers latency: 700 ms
  Leader commit interval: 210 ms
- Non-leader rule-order latency: 503 ms
  Rule 1 leader ratio: 41.58%
  Rule 2 leader ratio: 39.60%
  Rule 3 commit leader ratio: 6.93%

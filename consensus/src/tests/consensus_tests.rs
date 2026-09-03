@@ -734,6 +734,139 @@ fn direct_fallback_counts_distinct_anchor_parent_proposers() {
     );
 }
 
+#[test]
+fn unrelated_observation_does_not_dirty_fallback_anchor() {
+    let committee = mock_committee();
+    let mut state = State::new(Certificate::genesis(&committee));
+    let authorities: Vec<_> = keys().into_iter().map(|(key, _)| key).collect();
+    let (_, anchor) = mock_certificate(authorities[0], 4, BTreeSet::new());
+    state.observe(anchor.clone());
+    state.rule_three_anchors[1] = Some(4);
+    state.mark_fallback_anchor_dirty(4);
+    let snapshot = state.fallback_history_snapshot(&anchor);
+    state.dirty_fallback_anchors.clear();
+
+    state.observe(mock_certificate(authorities[1], 2, BTreeSet::new()).1);
+
+    assert!(!state.dirty_fallback_anchors.contains(&4));
+    assert_eq!(
+        state.fallback_anchor_versions.get(&4),
+        Some(&snapshot.version)
+    );
+}
+
+#[test]
+fn fallback_history_is_reused_at_the_same_version() {
+    let committee = mock_committee();
+    let mut state = State::new(Certificate::genesis(&committee));
+    let authority = keys()[0].0;
+    let (parent_digest, parent) = mock_certificate(authority, 3, BTreeSet::new());
+    state.observe(parent);
+    let (_, anchor) = mock_certificate(authority, 4, [parent_digest].iter().cloned().collect());
+    state.observe(anchor.clone());
+    state.rule_three_anchors[1] = Some(4);
+    state.mark_fallback_anchor_dirty(4);
+    let first = state.fallback_history_snapshot(&anchor);
+    let marker = Digest::default();
+    state
+        .fallback_history_cache
+        .get_mut(&4)
+        .unwrap()
+        .by_round
+        .insert(99, vec![marker.clone()]);
+
+    let second = state.fallback_history_snapshot(&anchor);
+
+    assert_eq!(first.version, second.version);
+    assert_eq!(second.by_round.get(&99), Some(&vec![marker]));
+}
+
+#[test]
+fn awaited_fallback_digest_dirties_only_its_anchor() {
+    let committee = mock_committee();
+    let mut state = State::new(Certificate::genesis(&committee));
+    let authority = keys()[0].0;
+    let (missing_digest, missing) = mock_certificate(authority, 3, BTreeSet::new());
+    let (_, anchor) = mock_certificate(
+        authority,
+        4,
+        [missing_digest.clone()].iter().cloned().collect(),
+    );
+    state.observe(anchor.clone());
+    state.rule_three_anchors[1] = Some(4);
+    state.mark_fallback_anchor_dirty(4);
+    let first = state.fallback_history_snapshot(&anchor);
+    assert!(!first.complete);
+    state.dirty_fallback_anchors.clear();
+
+    state.observe(missing);
+
+    let next_version = *state.fallback_anchor_versions.get(&4).unwrap();
+    assert!(next_version > first.version);
+    assert!(state.dirty_fallback_anchors.contains(&4));
+    assert!(!state
+        .fallback_evidence_waiters
+        .contains_key(&missing_digest));
+}
+
+#[test]
+fn late_strong_ancestor_dirties_anchor_using_the_descendant() {
+    let committee = mock_committee();
+    let mut state = State::new(Certificate::genesis(&committee));
+    let authorities: Vec<_> = keys().into_iter().map(|(key, _)| key).collect();
+    let (ancestor_digest, ancestor) = mock_certificate(authorities[0], 1, BTreeSet::new());
+    state.observe(ancestor);
+    let (parent_digest, parent) = mock_certificate(
+        authorities[1],
+        2,
+        [ancestor_digest].iter().cloned().collect(),
+    );
+    let (child_digest, child) = mock_certificate(
+        authorities[2],
+        3,
+        [parent_digest.clone()].iter().cloned().collect(),
+    );
+    state.observe(child);
+    let (_, anchor) = mock_certificate(
+        authorities[3],
+        4,
+        [child_digest.clone()].iter().cloned().collect(),
+    );
+    state.observe(anchor.clone());
+    state.rule_three_anchors[1] = Some(4);
+    state.mark_fallback_anchor_dirty(4);
+    assert!(!state.fallback_history_snapshot(&anchor).complete);
+    assert!(state
+        .fallback_vertex_users
+        .get(&child_digest)
+        .unwrap()
+        .contains(&4));
+    // Isolate the reverse dependency on the already traversed child. The
+    // parent's own missing-digest waiter is a separate wake-up path.
+    state.fallback_evidence_waiters.remove(&parent_digest);
+    state.dirty_fallback_anchors.clear();
+
+    state.observe(parent);
+
+    assert!(state.dirty_fallback_anchors.contains(&4));
+}
+
+#[test]
+fn fallback_decision_cache_requires_the_anchor_version() {
+    let committee = mock_committee();
+    let mut state = State::new(Certificate::genesis(&committee));
+    state.fallback_decision_cache.insert(
+        (7, 1),
+        FallbackDecision {
+            version: 5,
+            commit: true,
+        },
+    );
+
+    assert_eq!(state.fallback_decision(7, 1, 5), Some(true));
+    assert_eq!(state.fallback_decision(7, 1, 6), None);
+}
+
 #[tokio::test]
 async fn rule_three_requests_a_leader_without_any_observed_certificate() {
     let committee = mock_committee();

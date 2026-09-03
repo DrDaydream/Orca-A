@@ -35,6 +35,19 @@ type Dag = HashMap<Round, HashMap<PublicKey, (Digest, Certificate)>>;
 /// to consensus. A later grade-2 upgrade does not create another VDag node.
 type VDag = HashMap<Round, HashMap<PublicKey, (Digest, Certificate)>>;
 
+#[derive(Clone)]
+struct FallbackHistorySnapshot {
+    version: u64,
+    complete: bool,
+    by_round: HashMap<Round, Vec<Digest>>,
+}
+
+#[derive(Clone, Copy)]
+struct FallbackDecision {
+    version: u64,
+    commit: bool,
+}
+
 /// The state that needs to be persisted for crash-recovery.
 struct State {
     /// The last committed round.
@@ -100,6 +113,20 @@ struct State {
     rule_three_stacks: [BTreeSet<Round>; 3],
     /// Latest Good/Deferred leader that may recover each fallback lane.
     rule_three_anchors: [Option<Round>; 3],
+    /// Monotone revision of newly observed structural evidence.
+    fallback_evidence_version: u64,
+    /// Evidence revision assigned to each active recovery anchor.
+    fallback_anchor_versions: HashMap<Round, u64>,
+    /// Recovery anchors whose relevant evidence or lane contents changed.
+    dirty_fallback_anchors: HashSet<Round>,
+    /// Cached strong/weak causal-history traversal per recovery anchor.
+    fallback_history_cache: HashMap<Round, FallbackHistorySnapshot>,
+    /// Cached Rule-3 decision per `(anchor round, target round)`.
+    fallback_decision_cache: HashMap<(Round, Round), FallbackDecision>,
+    /// Reverse index from a traversed vertex to anchors using that vertex.
+    fallback_vertex_users: HashMap<Digest, HashSet<Round>>,
+    /// Missing causal or virtual evidence awaited by recovery anchors.
+    fallback_evidence_waiters: HashMap<Digest, HashSet<Round>>,
     /// Rule-3 leaders whose data is being recovered from GRBC/other nodes.
     rule_three_recovery: HashSet<Round>,
     /// Missing leaders awaiting their next rate-limited retry.
@@ -114,9 +141,6 @@ struct State {
     highest_advanced_round: Round,
     /// Non-blocking handoff to the single ordered cleanup/application writer.
     commit_tx: Option<mpsc::UnboundedSender<Vec<Certificate>>>,
-    /// Prevent duplicate benchmark records when a preordered DAG is revisited.
-    #[cfg(feature = "benchmark")]
-    logged_rule_order: HashMap<Digest, Round>,
 }
 
 impl State {
@@ -190,14 +214,19 @@ impl State {
             ready_pending: BTreeSet::new(),
             rule_three_stacks: [BTreeSet::new(), BTreeSet::new(), BTreeSet::new()],
             rule_three_anchors: [None, None, None],
+            fallback_evidence_version: 0,
+            fallback_anchor_versions: HashMap::new(),
+            dirty_fallback_anchors: HashSet::new(),
+            fallback_history_cache: HashMap::new(),
+            fallback_decision_cache: HashMap::new(),
+            fallback_vertex_users: HashMap::new(),
+            fallback_evidence_waiters: HashMap::new(),
             rule_three_recovery: HashSet::new(),
             missing_leader_requests: HashMap::new(),
             forced_history_waiters: HashMap::new(),
             dirty_leaders: HashSet::new(),
             highest_advanced_round: 1,
             commit_tx: None,
-            #[cfg(feature = "benchmark")]
-            logged_rule_order: HashMap::new(),
         }
     }
 
@@ -211,6 +240,135 @@ impl State {
             .as_millis();
         self.rule_ready_at_ms.insert(round, ready_at);
         Some(ready_at)
+    }
+
+    fn mark_fallback_anchor_dirty(&mut self, anchor_round: Round) {
+        let lane = (anchor_round % 3) as usize;
+        if self.rule_three_anchors[lane] != Some(anchor_round) {
+            return;
+        }
+        self.fallback_anchor_versions
+            .insert(anchor_round, self.fallback_evidence_version);
+        self.dirty_fallback_anchors.insert(anchor_round);
+    }
+
+    fn mark_fallback_digest_changed(&mut self, digest: &Digest) {
+        let mut anchors = self
+            .fallback_vertex_users
+            .get(digest)
+            .cloned()
+            .unwrap_or_default();
+        anchors.extend(
+            self.fallback_evidence_waiters
+                .remove(digest)
+                .unwrap_or_default(),
+        );
+        for anchor in anchors {
+            self.mark_fallback_anchor_dirty(anchor);
+        }
+    }
+
+    fn fallback_history_snapshot(&mut self, anchor: &Certificate) -> FallbackHistorySnapshot {
+        let anchor_round = anchor.round();
+        let version = self
+            .fallback_anchor_versions
+            .get(&anchor_round)
+            .copied()
+            .unwrap_or(self.fallback_evidence_version);
+        if let Some(snapshot) = self.fallback_history_cache.get(&anchor_round) {
+            if snapshot.version == version {
+                return snapshot.clone();
+            }
+        }
+
+        let mut snapshot = FallbackHistorySnapshot {
+            version,
+            complete: true,
+            by_round: HashMap::new(),
+        };
+        let mut pending: Vec<_> = anchor
+            .header
+            .parents
+            .iter()
+            .chain(&anchor.header.weak_edges)
+            .cloned()
+            .collect();
+        let mut visited = HashSet::new();
+
+        for digest in &anchor.header.virtual_edges {
+            if !self.observed.contains_key(digest) {
+                snapshot.complete = false;
+                self.fallback_evidence_waiters
+                    .entry(digest.clone())
+                    .or_default()
+                    .insert(anchor_round);
+            }
+        }
+        while let Some(digest) = pending.pop() {
+            if !visited.insert(digest.clone()) {
+                continue;
+            }
+            let (vertex_round, virtual_edges, dependencies) = match self.observed.get(&digest) {
+                Some(vertex) => (
+                    vertex.round(),
+                    vertex
+                        .header
+                        .virtual_edges
+                        .iter()
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                    vertex
+                        .header
+                        .parents
+                        .iter()
+                        .chain(&vertex.header.weak_edges)
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                ),
+                None => {
+                    snapshot.complete = false;
+                    self.fallback_evidence_waiters
+                        .entry(digest)
+                        .or_default()
+                        .insert(anchor_round);
+                    continue;
+                }
+            };
+            self.fallback_vertex_users
+                .entry(digest.clone())
+                .or_default()
+                .insert(anchor_round);
+            snapshot
+                .by_round
+                .entry(vertex_round)
+                .or_default()
+                .push(digest.clone());
+            for virtual_digest in virtual_edges {
+                if !self.observed.contains_key(&virtual_digest) {
+                    snapshot.complete = false;
+                    self.fallback_evidence_waiters
+                        .entry(virtual_digest)
+                        .or_default()
+                        .insert(anchor_round);
+                }
+            }
+            pending.extend(dependencies);
+        }
+        self.fallback_history_cache
+            .insert(anchor_round, snapshot.clone());
+        snapshot
+    }
+
+    fn fallback_decision(
+        &self,
+        anchor_round: Round,
+        target_round: Round,
+        version: u64,
+    ) -> Option<bool> {
+        self.fallback_decision_cache
+            .get(&(anchor_round, target_round))
+            .filter(|decision| decision.version == version)
+            .map(|decision| decision.commit)
     }
 
     fn observe(&mut self, certificate: Certificate) -> HashSet<Round> {
@@ -232,6 +390,8 @@ impl State {
                 entry.insert(certificate.clone());
             }
         }
+        self.fallback_evidence_version = self.fallback_evidence_version.wrapping_add(1);
+        self.mark_fallback_digest_changed(&digest);
         let mut dirty = self.index_strong_paths(&certificate);
         // The certificate may be a late leader or the endpoint of virtual
         // paths that were already present in descendants.
@@ -288,6 +448,7 @@ impl State {
             if fresh.is_empty() {
                 continue;
             }
+            self.mark_fallback_digest_changed(&digest);
             if let Some(block) = self.observed.get(&digest) {
                 let round = block.round();
                 let origin = block.origin();
@@ -592,9 +753,28 @@ impl State {
             .retain(|round, _| *round + gc_depth >= last_committed_round);
         self.deferred_rule_one
             .retain(|round, _| *round + gc_depth >= last_committed_round);
-        #[cfg(feature = "benchmark")]
-        self.logged_rule_order
-            .retain(|_, round| *round + gc_depth >= last_committed_round);
+        let active_anchors: HashSet<_> =
+            self.rule_three_anchors.iter().flatten().cloned().collect();
+        let keep_anchor = |round: &Round| {
+            active_anchors.contains(round) || *round + gc_depth >= last_committed_round
+        };
+        self.fallback_anchor_versions
+            .retain(|round, _| keep_anchor(round));
+        self.dirty_fallback_anchors
+            .retain(|round| keep_anchor(round));
+        self.fallback_history_cache
+            .retain(|round, _| keep_anchor(round));
+        self.fallback_decision_cache.retain(|(anchor, target), _| {
+            keep_anchor(anchor) && *target + gc_depth >= last_committed_round
+        });
+        self.fallback_vertex_users.retain(|digest, anchors| {
+            anchors.retain(|round| keep_anchor(round));
+            observed_digests.contains(digest) && !anchors.is_empty()
+        });
+        self.fallback_evidence_waiters.retain(|_, anchors| {
+            anchors.retain(|round| keep_anchor(round));
+            !anchors.is_empty()
+        });
     }
 }
 
@@ -867,6 +1047,9 @@ impl Consensus {
             // unrelated history.
             if observed_origin == self.ordering_leader_authority(observed_round) {
                 state.dirty_leaders.insert(observed_round);
+                if let Some(anchor) = state.rule_three_anchors[(observed_round % 3) as usize] {
+                    state.mark_fallback_anchor_dirty(anchor);
+                }
             }
 
             // A leader that is already commit-ready/recovering no longer has
@@ -937,7 +1120,12 @@ impl Consensus {
                     && !state.skipped_leaders.contains(&fallback_round)
                     && !state.pending_leaders.contains_key(&fallback_round)
                 {
-                    state.rule_three_stacks[(fallback_round % 3) as usize].insert(fallback_round);
+                    let lane = (fallback_round % 3) as usize;
+                    if state.rule_three_stacks[lane].insert(fallback_round) {
+                        if let Some(anchor) = state.rule_three_anchors[lane] {
+                            state.mark_fallback_anchor_dirty(anchor);
+                        }
+                    }
                 }
             }
         }
@@ -1308,28 +1496,17 @@ impl Consensus {
     /// anchor's strong/weak causal history.
     fn indirect_fallback_stake(
         &self,
-        anchor: &Certificate,
+        history: &FallbackHistorySnapshot,
         target: Option<&Certificate>,
         leader_round: Round,
         leader: PublicKey,
         state: &State,
     ) -> Stake {
         let history_round = leader_round + 3;
-        let mut pending: Vec<_> = anchor
-            .header
-            .parents
-            .iter()
-            .chain(&anchor.header.weak_edges)
-            .cloned()
-            .collect();
-        let mut visited = HashSet::new();
         let mut voters = HashSet::new();
         let mut stake = 0;
 
-        while let Some(digest) = pending.pop() {
-            if !visited.insert(digest.clone()) {
-                continue;
-            }
+        for digest in history.by_round.get(&history_round).into_iter().flatten() {
             let vertex = match Self::observed_certificate(&digest, state) {
                 Some(vertex) => vertex,
                 None => continue,
@@ -1348,65 +1525,9 @@ impl Consensus {
                         break;
                     }
                 }
-                continue;
-            }
-            if vertex.round() > history_round {
-                pending.extend(
-                    vertex
-                        .header
-                        .parents
-                        .iter()
-                        .chain(&vertex.header.weak_edges)
-                        .cloned(),
-                );
             }
         }
         stake
-    }
-
-    fn fallback_history_complete(&self, anchor: &Certificate, state: &State) -> bool {
-        let mut pending: Vec<_> = anchor
-            .header
-            .parents
-            .iter()
-            .chain(&anchor.header.weak_edges)
-            .cloned()
-            .collect();
-        if anchor
-            .header
-            .virtual_edges
-            .iter()
-            .any(|digest| !state.observed.contains_key(digest))
-        {
-            return false;
-        }
-        let mut visited = HashSet::new();
-        while let Some(digest) = pending.pop() {
-            if !visited.insert(digest.clone()) {
-                continue;
-            }
-            let vertex = match Self::observed_certificate(&digest, state) {
-                Some(vertex) => vertex,
-                None => return false,
-            };
-            if vertex
-                .header
-                .virtual_edges
-                .iter()
-                .any(|digest| !state.observed.contains_key(digest))
-            {
-                return false;
-            }
-            pending.extend(
-                vertex
-                    .header
-                    .parents
-                    .iter()
-                    .chain(&vertex.header.weak_edges)
-                    .cloned(),
-            );
-        }
-        true
     }
 
     fn stage_leader_commit(&self, leader: Certificate, rule: u8, state: &mut State) {
@@ -1426,21 +1547,6 @@ impl Consensus {
         }
         state.leader_commit_rules.entry(round).or_insert(rule);
         let ordered = self.order_dag(&leader, state);
-        #[cfg(feature = "benchmark")]
-        for certificate in &ordered {
-            if certificate.origin() != self.ordering_leader_authority(certificate.round())
-                && state
-                    .logged_rule_order
-                    .insert(certificate.header.digest(), certificate.round())
-                    .is_none()
-            {
-                info!(
-                    "Header rule-ordered round {} digest {:?}",
-                    certificate.round(),
-                    certificate.header.digest()
-                );
-            }
-        }
         state.pending_order.insert(round, ordered);
         state.pending_leaders.entry(round).or_insert(leader);
         state.wake_pending(round);
@@ -1487,27 +1593,40 @@ impl Consensus {
                 continue;
             }
             let leader = self.observed_leader(target_round, state);
-            if !self.fallback_history_complete(&anchor, state) {
+            let history = state.fallback_history_snapshot(&anchor);
+            if !history.complete {
                 if leader.is_none() {
                     self.request_missing_leader(target_round, state).await;
                 }
                 break;
             }
             let leader_authority = self.ordering_leader_authority(target_round);
-            let commit = if anchor.round() <= target_round + 3 {
+            let decision_key = (anchor.round(), target_round);
+            let commit = if let Some(commit) =
+                state.fallback_decision(anchor.round(), target_round, history.version)
+            {
+                commit
+            } else if anchor.round() <= target_round + 3 {
                 leader.as_ref().map_or(false, |target| {
                     self.has_strong_path(&anchor, &target.digest(), state)
                 }) || self.direct_fallback_stake(&anchor, target_round, leader_authority, state)
                     >= self.committee.validity_threshold()
             } else {
                 self.indirect_fallback_stake(
-                    &anchor,
+                    &history,
                     leader.as_ref(),
                     target_round,
                     leader_authority,
                     state,
                 ) >= self.committee.validity_threshold()
             };
+            state.fallback_decision_cache.insert(
+                decision_key,
+                FallbackDecision {
+                    version: history.version,
+                    commit,
+                },
+            );
 
             if commit {
                 let target = match leader {
@@ -1526,6 +1645,9 @@ impl Consensus {
                 self.stage_leader_commit(target.clone(), 3, state);
                 anchor = target;
                 state.rule_three_anchors[lane] = Some(anchor.round());
+                state.mark_fallback_anchor_dirty(anchor.round());
+                // This invocation immediately continues with the new anchor.
+                state.dirty_fallback_anchors.remove(&anchor.round());
             } else {
                 sampled_debug!(
                     target_round,
@@ -1539,21 +1661,26 @@ impl Consensus {
         self.drain_ready_leaders(state).await;
     }
 
-    async fn evaluate_fallback_anchors(&mut self, state: &mut State) {
-        let anchors: Vec<_> = state.rule_three_anchors.iter().flatten().cloned().collect();
-        for anchor in anchors {
-            self.finalize_fallback(anchor, state).await;
+    async fn evaluate_dirty_fallback_anchors(&mut self, state: &mut State) {
+        while let Some(anchor) = state.dirty_fallback_anchors.iter().next().cloned() {
+            state.dirty_fallback_anchors.remove(&anchor);
+            let lane = (anchor % 3) as usize;
+            if state.rule_three_anchors[lane] == Some(anchor) {
+                self.finalize_fallback(anchor, state).await;
+            }
         }
     }
 
     #[cfg(test)]
     async fn evaluate_commit_rule_three(&mut self, state: &mut State) {
-        self.evaluate_fallback_anchors(state).await;
+        let anchors: Vec<_> = state.rule_three_anchors.iter().flatten().cloned().collect();
+        for anchor in anchors {
+            state.mark_fallback_anchor_dirty(anchor);
+        }
+        self.evaluate_dirty_fallback_anchors(state).await;
     }
 
-    /// Every newly observed or promoted piece of evidence can complete an old
-    /// strong/virtual predicate, so retry both the affected Good/Deferred
-    /// leaders and all three active fallback anchors.
+    /// Retry only leaders and fallback anchors whose indexed evidence changed.
     async fn process_dirty_leaders(&mut self, state: &mut State) {
         loop {
             let dirty: Vec<_> = state.dirty_leaders.drain().collect();
@@ -1566,8 +1693,8 @@ impl Consensus {
                     self.evaluate_commit_rule_two(leader_round + 2, state).await;
                 }
             }
-            self.evaluate_fallback_anchors(state).await;
-            if state.dirty_leaders.is_empty() {
+            self.evaluate_dirty_fallback_anchors(state).await;
+            if state.dirty_leaders.is_empty() && state.dirty_fallback_anchors.is_empty() {
                 break;
             }
         }
@@ -1704,7 +1831,8 @@ impl Consensus {
                 state.rule_three_anchors[lane] = Some(round);
             }
             let anchor_round = state.rule_three_anchors[lane].unwrap_or(round);
-            self.finalize_fallback(anchor_round, state).await;
+            state.mark_fallback_anchor_dirty(anchor_round);
+            self.evaluate_dirty_fallback_anchors(state).await;
         }
         self.stage_leader_commit(leader, rule, state);
         self.drain_ready_leaders(state).await;
