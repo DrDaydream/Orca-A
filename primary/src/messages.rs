@@ -64,6 +64,11 @@ impl Header {
                 && self.weak_edges.is_disjoint(&self.virtual_edges),
             DagError::MalformedHeader(self.id.clone())
         );
+        let max_weak = committee.size().saturating_sub(1) / 3;
+        ensure!(
+            self.weak_edges.len() <= max_weak,
+            DagError::MalformedHeader(self.id.clone())
+        );
 
         // Ensure the authority has voting rights.
         let voting_rights = committee.stake(&self.author);

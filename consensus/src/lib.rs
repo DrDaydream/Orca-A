@@ -95,12 +95,14 @@ struct State {
     /// Pending rounds whose direct predecessor is already committed/skipped.
     /// This avoids repeatedly scanning the complete pending map.
     ready_pending: BTreeSet<Round>,
-    /// Commit-ready rule-3 observers split into the three independent r+3x
-    /// backtracking chains. Index is `round % 3`.
+    /// Leaders still awaiting pessimistic finalization, split into the three
+    /// independent `r mod 3` fallback lanes.
     rule_three_stacks: [BTreeSet<Round>; 3],
+    /// Latest Good/Deferred leader that may recover each fallback lane.
+    rule_three_anchors: [Option<Round>; 3],
     /// Rule-3 leaders whose data is being recovered from GRBC/other nodes.
     rule_three_recovery: HashSet<Round>,
-    /// Missing leaders awaiting their single retry, indexed by retry deadline.
+    /// Missing leaders awaiting their next rate-limited retry.
     missing_leader_requests: HashMap<Round, Instant>,
     /// Causal-history digests authorized by a successful rule-3 recovery but
     /// not observed locally yet, mapped to the leader rounds they unblock.
@@ -187,6 +189,7 @@ impl State {
             pending_order: HashMap::new(),
             ready_pending: BTreeSet::new(),
             rule_three_stacks: [BTreeSet::new(), BTreeSet::new(), BTreeSet::new()],
+            rule_three_anchors: [None, None, None],
             rule_three_recovery: HashSet::new(),
             missing_leader_requests: HashMap::new(),
             forced_history_waiters: HashMap::new(),
@@ -212,6 +215,7 @@ impl State {
 
     fn observe(&mut self, certificate: Certificate) -> HashSet<Round> {
         let digest = certificate.digest();
+        let certificate_round = certificate.round();
         self.observed_by_round
             .entry(certificate.round())
             .or_insert_with(HashMap::new)
@@ -228,7 +232,15 @@ impl State {
                 entry.insert(certificate.clone());
             }
         }
-        self.index_strong_paths(&certificate);
+        let mut dirty = self.index_strong_paths(&certificate);
+        // The certificate may be a late leader or the endpoint of virtual
+        // paths that were already present in descendants.
+        dirty.insert(certificate_round);
+        for target in &certificate.header.virtual_edges {
+            if let Some(block) = self.observed.get(target) {
+                dirty.insert(block.round());
+            }
+        }
         let owners = self
             .forced_history_waiters
             .remove(&digest)
@@ -236,10 +248,11 @@ impl State {
         for owner_round in &owners {
             self.force_observed_history_to_dag(certificate.clone(), *owner_round);
         }
-        owners
+        dirty.extend(owners);
+        dirty
     }
 
-    fn index_strong_paths(&mut self, certificate: &Certificate) {
+    fn index_strong_paths(&mut self, certificate: &Certificate) -> HashSet<Round> {
         let digest = certificate.digest();
         let mut additions = HashSet::new();
         for parent in &certificate.header.parents {
@@ -256,11 +269,16 @@ impl State {
                 additions.extend(ancestors.iter().cloned());
             }
         }
-        self.propagate_strong_ancestors(digest, additions);
+        self.propagate_strong_ancestors(digest, additions)
     }
 
-    fn propagate_strong_ancestors(&mut self, source: Digest, additions: HashSet<Digest>) {
+    fn propagate_strong_ancestors(
+        &mut self,
+        source: Digest,
+        additions: HashSet<Digest>,
+    ) -> HashSet<Round> {
         let mut pending = vec![(source, additions)];
+        let mut dirty = HashSet::new();
         while let Some((digest, candidates)) = pending.pop() {
             let ancestors = self.strong_ancestors.entry(digest.clone()).or_default();
             let fresh: HashSet<_> = candidates
@@ -274,6 +292,9 @@ impl State {
                 let round = block.round();
                 let origin = block.origin();
                 for ancestor in &fresh {
+                    if let Some(target) = self.observed.get(ancestor) {
+                        dirty.insert(target.round());
+                    }
                     self.observed_strong_support
                         .entry((round, ancestor.clone()))
                         .or_default()
@@ -292,6 +313,7 @@ impl State {
                 }
             }
         }
+        dirty
     }
 
     /// Rule 3 accepts verified GRBC data without waiting for grade 1/2. Insert
@@ -309,7 +331,6 @@ impl State {
                 .parents
                 .iter()
                 .chain(&certificate.header.weak_edges)
-                .chain(&certificate.header.virtual_edges)
             {
                 // Dag membership is digest-idempotent. Shared strong/weak
                 // ancestors commonly occur in several commit-ready histories;
@@ -414,6 +435,12 @@ impl State {
         self.dag_by_digest.insert(digest.clone(), certificate);
         if !self.dag_digests.insert(digest.clone()) {
             return;
+        }
+        if round >= 2 {
+            self.dirty_leaders.insert(round - 1);
+        }
+        if round >= 3 {
+            self.dirty_leaders.insert(round - 2);
         }
         if let Some(ancestors) = self.strong_ancestors.get(&digest) {
             for ancestor in ancestors {
@@ -636,6 +663,10 @@ impl Consensus {
     }
 
     fn mark_rule_three_skipped(&self, round: Round, state: &mut State) {
+        state.rule_three_stacks[(round % 3) as usize].remove(&round);
+        state.rule_three_recovery.remove(&round);
+        state.missing_leader_requests.remove(&round);
+        state.dirty_leaders.remove(&round);
         if state.mark_skipped(round) {
             #[cfg(feature = "benchmark")]
             info!(
@@ -900,6 +931,15 @@ impl Consensus {
             let round = state.highest_advanced_round;
             self.evaluate_commit_rule_one(round, state).await;
             self.evaluate_commit_rule_two(round, state).await;
+            if round >= 4 {
+                let fallback_round = round - 3;
+                if !state.committed_leaders.contains(&fallback_round)
+                    && !state.skipped_leaders.contains(&fallback_round)
+                    && !state.pending_leaders.contains_key(&fallback_round)
+                {
+                    state.rule_three_stacks[(fallback_round % 3) as usize].insert(fallback_round);
+                }
+            }
         }
         self.process_dirty_leaders(state).await;
     }
@@ -1164,45 +1204,6 @@ impl Consensus {
         false
     }
 
-    /// Whether `observer`'s causal history has ever referenced `target` using
-    /// a strong parent or a virtual edge. Weak edges deliberately do not count
-    /// as observing a leader for rule 3.
-    fn history_references_strong_or_virtual(
-        &self,
-        observer: &Certificate,
-        target: &Digest,
-        state: &State,
-    ) -> bool {
-        let mut pending: Vec<_> = observer
-            .header
-            .parents
-            .iter()
-            .chain(&observer.header.virtual_edges)
-            .cloned()
-            .collect();
-        let mut visited = HashSet::new();
-
-        while let Some(digest) = pending.pop() {
-            if &digest == target {
-                return true;
-            }
-            if !visited.insert(digest.clone()) {
-                continue;
-            }
-            if let Some(block) = Self::observed_certificate(&digest, state) {
-                pending.extend(
-                    block
-                        .header
-                        .parents
-                        .iter()
-                        .chain(&block.header.virtual_edges)
-                        .cloned(),
-                );
-            }
-        }
-        false
-    }
-
     /// Exactly two hops: one strong edge followed by one virtual edge to the
     /// target leader.
     fn has_two_hop_virtual_path(
@@ -1217,359 +1218,344 @@ impl Consensus {
         })
     }
 
-    /// Counts exact three-edge virtual paths from `higher` to `lower`:
-    /// higher --parent--> block --parent--> block --virtual--> lower.
-    /// Paths are distinct when either intermediate block differs, so the
-    /// identity of a path is `(first_digest, second_digest)`.
-    fn three_edge_virtual_path_stake(
+    fn virtual_path_to_leader(
         &self,
-        higher: &Certificate,
-        lower: &Digest,
+        block: &Certificate,
+        leader_round: Round,
+        leader: PublicKey,
         state: &State,
-    ) -> Stake {
-        let mut paths = HashSet::new();
-        for first_digest in &higher.header.parents {
-            if let Some(first) = Self::observed_certificate(first_digest, state) {
-                for second_digest in &first.header.parents {
-                    if Self::observed_certificate(second_digest, state)
-                        .map_or(false, |second| second.header.virtual_edges.contains(lower))
-                    {
-                        paths.insert((first_digest.clone(), second_digest.clone()));
-                    }
-                }
-            }
-        }
-        paths.len() as Stake
-    }
-
-    /// Bridge a missing leader three rounds below `higher`. Accept a pure
-    /// strong path, f+1 `(strong,strong,virtual) x 2` paths distinguished by
-    /// their first (round h-1) vertex, or a three-strong prefix followed by
-    /// f+1 `(strong,strong,virtual)` suffixes distinguished by the suffix's
-    /// first strong vertex.
-    fn missing_leader_bridge(&self, higher: &Certificate, target: &Digest, state: &State) -> bool {
-        if self.has_strong_path(higher, target, state) {
-            return true;
-        }
-
-        let threshold = self.committee.validity_threshold();
-        let mut double_segment_first = HashSet::new();
-        let mut suffix_first = HashSet::new();
-
-        for first_digest in &higher.header.parents {
-            let first = match Self::observed_certificate(first_digest, state) {
-                Some(block) => block,
-                None => continue,
-            };
-            for second_digest in &first.header.parents {
-                let second = match Self::observed_certificate(second_digest, state) {
-                    Some(block) => block,
+    ) -> bool {
+        let mut frontier: Vec<_> = block.header.parents.iter().cloned().collect();
+        for _ in 0..2 {
+            let mut next = Vec::new();
+            for digest in frontier {
+                let vertex = match Self::observed_certificate(&digest, state) {
+                    Some(vertex) => vertex,
                     None => continue,
                 };
-
-                // First alternative: (strong,strong,virtual) x 2. Only the
-                // first vertex of the whole path must be distinct.
-                for middle_digest in &second.header.virtual_edges {
-                    if let Some(middle) = Self::observed_certificate(middle_digest, state) {
-                        let mut qualifies = false;
-                        for suffix_first_digest in &middle.header.parents {
-                            if let Some(suffix_first_block) =
-                                Self::observed_certificate(suffix_first_digest, state)
-                            {
-                                for suffix_second_digest in &suffix_first_block.header.parents {
-                                    if Self::observed_certificate(suffix_second_digest, state)
-                                        .map_or(false, |suffix_second| {
-                                            suffix_second.header.virtual_edges.contains(target)
-                                        })
-                                    {
-                                        qualifies = true;
-                                    }
-                                }
-                            }
-                        }
-                        if qualifies {
-                            double_segment_first.insert(first_digest.clone());
-                        }
-                    }
+                if vertex.header.virtual_edges.iter().any(|target| {
+                    Self::observed_certificate(target, state).map_or(false, |endpoint| {
+                        endpoint.round() == leader_round && endpoint.origin() == leader
+                    })
+                }) {
+                    return true;
                 }
-
-                // Second alternative: exactly three strong edges, followed
-                // by f+1 strong,strong,virtual suffixes. Suffixes are distinct
-                // by their first strong vertex.
-                for prefix_end_digest in &second.header.parents {
-                    if let Some(prefix_end) = Self::observed_certificate(prefix_end_digest, state) {
-                        for suffix_first_digest in &prefix_end.header.parents {
-                            if let Some(suffix_first_block) =
-                                Self::observed_certificate(suffix_first_digest, state)
-                            {
-                                if suffix_first_block.header.parents.iter().any(|digest| {
-                                    Self::observed_certificate(digest, state).map_or(
-                                        false,
-                                        |suffix_second| {
-                                            suffix_second.header.virtual_edges.contains(target)
-                                        },
-                                    )
-                                }) {
-                                    suffix_first.insert(suffix_first_digest.clone());
-                                }
-                            }
-                        }
-                    }
-                }
+                next.extend(vertex.header.parents.iter().cloned());
             }
+            frontier = next;
         }
-
-        double_segment_first.len() as Stake >= threshold || suffix_first.len() as Stake >= threshold
+        false
     }
 
-    fn bridged_predecessor(
+    /// Direct fallback votes are anchor strong parents, not individual paths.
+    /// A proposer contributes its stake at most once even if its parent has
+    /// several qualifying virtual paths.
+    fn direct_fallback_stake(
         &self,
-        higher: &Certificate,
-        missing_round: Round,
+        anchor: &Certificate,
+        leader_round: Round,
+        leader: PublicKey,
         state: &State,
-    ) -> Option<(Round, Certificate)> {
-        let mut candidate_round = missing_round.checked_sub(3)?;
-        loop {
-            if let Some(candidate) = self.observed_leader(candidate_round, state) {
-                if self.missing_leader_bridge(higher, &candidate.digest(), state) {
-                    return Some((candidate_round, candidate));
-                }
-            }
-
-            if candidate_round < 4 {
-                return None;
-            }
-            candidate_round -= 3;
-        }
-    }
-
-    /// Commit rule 3 resolves leaders that did not satisfy rules 1 or 2.
-    /// A commit-ready leader at round h observes leaders h-3, h-6, ... .
-    /// Every adjacent pair in that chain must have either a strong path or
-    /// f+1 distinct three-edge virtual paths. The target is
-    /// marked commit-ready when the whole chain succeeds, otherwise skipped.
-    #[cfg(test)]
-    async fn evaluate_commit_rule_three(&mut self, state: &mut State) {
-        let observers: Vec<_> = state.pending_leaders.keys().cloned().collect();
-        self.evaluate_commit_rule_three_for(observers, state).await;
-    }
-
-    async fn evaluate_commit_rule_three_for(&mut self, observers: Vec<Round>, state: &mut State) {
-        for observer_round in observers {
-            if observer_round < 4 {
-                continue;
-            }
-
-            let mut target_round = observer_round - 3;
-            loop {
-                if !state.committed_leaders.contains(&target_round)
-                    && !state.skipped_leaders.contains(&target_round)
-                    && !state.pending_leaders.contains_key(&target_round)
-                {
-                    let observer = self.observed_leader(observer_round, state);
-                    let mut target = self.observed_leader(target_round, state);
-                    if target.is_none() {
-                        let bridge = observer.as_ref().and_then(|higher| {
-                            self.bridged_predecessor(higher, target_round, state)
-                        });
-                        if let Some((bridged_round, bridged_target)) = bridge {
-                            let bridged_target_resolved =
-                                state.committed_leaders.contains(&bridged_round)
-                                    || state.skipped_leaders.contains(&bridged_round)
-                                    || state.pending_leaders.contains_key(&bridged_round);
-                            let mut skipped_round = target_round;
-                            while skipped_round > bridged_round {
-                                if !state.committed_leaders.contains(&skipped_round)
-                                    && !state.pending_leaders.contains_key(&skipped_round)
-                                {
-                                    sampled_debug!(
-                                        skipped_round,
-                                        "Skipping absent leader round {} after bridge from round {} to round {}",
-                                        skipped_round,
-                                        observer_round,
-                                        bridged_round
-                                    );
-                                    self.mark_rule_three_skipped(skipped_round, state);
-                                }
-                                skipped_round -= 3;
-                            }
-                            target_round = bridged_round;
-                            if bridged_target_resolved {
-                                self.drain_ready_leaders(state).await;
-                                if target_round < 4 {
-                                    break;
-                                }
-                                target_round -= 3;
-                                continue;
-                            }
-                            target = Some(bridged_target);
-                        } else {
-                            sampled_debug!(
-                                target_round,
-                                "Requesting absent leader round {} after rule-3 bridge search failed",
-                                target_round
-                            );
-                            self.request_missing_leader(target_round, state).await;
-                            break;
-                        }
-                    }
-                    let target_digest = target.as_ref().unwrap().digest();
-                    if observer.as_ref().map_or(true, |observer| {
-                        !self.history_references_strong_or_virtual(observer, &target_digest, state)
-                    }) {
-                        sampled_debug!(target_round,
-                            "Skipping leader round {}: leader round {} history has no parents/virtual reference to its digest",
-                            target_round, observer_round
-                        );
-                        self.mark_rule_three_skipped(target_round, state);
-                        self.drain_ready_leaders(state).await;
-                        if target_round < 4 {
-                            break;
-                        }
-                        target_round -= 3;
-                        continue;
-                    }
-                    let mut chain_round = observer_round;
-                    let mut chain_valid = true;
-                    let mut waiting_for_recovery = false;
-
-                    while chain_valid && chain_round > target_round {
-                        let lower_round = chain_round - 3;
-                        let higher = self.observed_leader(chain_round, state);
-                        let lower = if state.skipped_leaders.contains(&lower_round) {
-                            None
-                        } else {
-                            self.observed_leader(lower_round, state)
-                        };
-                        let mut jump_to_target = false;
-                        let mut bridged_chain_round = None;
-                        chain_valid = match (higher, lower) {
-                            (Some(higher), Some(lower)) => {
-                                let lower_digest = lower.digest();
-                                self.has_strong_path(&higher, &lower_digest, state)
-                                    || self.three_edge_virtual_path_stake(
-                                        &higher,
-                                        &lower_digest,
-                                        state,
-                                    ) >= self.committee.validity_threshold()
-                            }
-                            (Some(higher), None) => {
-                                if state.skipped_leaders.contains(&lower_round) {
-                                    let target_digest = target.as_ref().unwrap().digest();
-                                    if self.missing_leader_bridge(&higher, &target_digest, state) {
-                                        jump_to_target = true;
-                                        true
-                                    } else {
-                                        waiting_for_recovery = true;
-                                        self.request_missing_leader(target_round, state).await;
-                                        false
-                                    }
-                                } else if let Some((bridged_round, _)) =
-                                    self.bridged_predecessor(&higher, lower_round, state)
-                                {
-                                    let mut skipped_round = lower_round;
-                                    while skipped_round > bridged_round {
-                                        sampled_debug!(
-                                            skipped_round,
-                                            "Skipping absent leader round {} after bridge from round {} to round {}",
-                                            skipped_round,
-                                            chain_round,
-                                            bridged_round
-                                        );
-                                        self.mark_rule_three_skipped(skipped_round, state);
-                                        skipped_round -= 3;
-                                    }
-                                    jump_to_target = bridged_round == target_round;
-                                    bridged_chain_round = Some(bridged_round);
-                                    true
-                                } else {
-                                    waiting_for_recovery = true;
-                                    sampled_debug!(
-                                        lower_round,
-                                        "Requesting absent leader round {} after rule-3 chain bridge failed",
-                                        lower_round
-                                    );
-                                    self.request_missing_leader(lower_round, state).await;
-                                    false
-                                }
-                            }
-                            (None, _) => {
-                                waiting_for_recovery = true;
-                                sampled_debug!(
-                                    chain_round,
-                                    "Requesting absent leader round {} after rule-3 chain bridge failed",
-                                    chain_round
-                                );
-                                self.request_missing_leader(chain_round, state).await;
-                                false
-                            }
-                        };
-                        chain_round = if jump_to_target {
-                            target_round
-                        } else if let Some(bridged_round) = bridged_chain_round {
-                            bridged_round
-                        } else {
-                            lower_round
-                        };
-                    }
-
-                    if waiting_for_recovery {
-                        break;
-                    }
-
-                    if chain_valid {
-                        let target = target.unwrap();
-                        state.force_observed_history_to_dag(target.clone(), target_round);
-                        state.rule_three_recovery.remove(&target_round);
-                        state.missing_leader_requests.remove(&target_round);
-                        sampled_debug!(
-                            target_round,
-                            "Leader {:?} marked commit-ready by commit rule 3 through round {}",
-                            target,
-                            observer_round
-                        );
-                        let ordered = self.order_dag(&target, state);
-                        state.pending_order.insert(target_round, ordered);
-                        state.pending_leaders.insert(target_round, target.clone());
-                        state.leader_commit_rules.entry(target_round).or_insert(3);
-                        if let Some(_ready_at) = state.record_rule_ready(target_round) {
-                            #[cfg(feature = "benchmark")]
-                            info!(
-                                "Leader commit-ready round {} digest {:?} at {}",
-                                target_round,
-                                target.header.digest(),
-                                _ready_at
-                            );
-                        }
-                        state.rule_three_stacks[(target_round % 3) as usize].insert(target_round);
-                        state.wake_pending(target_round);
-                    } else {
-                        sampled_debug!(
-                            target_round,
-                            "Skipping leader round {} by commit rule 3 observed from round {}",
-                            target_round,
-                            observer_round
-                        );
-                        self.mark_rule_three_skipped(target_round, state);
-                    }
-                    self.drain_ready_leaders(state).await;
-                }
-
-                if target_round < 4 {
+    ) -> Stake {
+        let mut voters = HashSet::new();
+        let mut stake = 0;
+        for digest in &anchor.header.parents {
+            let parent = match Self::observed_certificate(digest, state) {
+                Some(parent) => parent,
+                None => continue,
+            };
+            let proposer = parent.origin();
+            if self.virtual_path_to_leader(parent, leader_round, leader, state)
+                && voters.insert(proposer)
+            {
+                stake += self.committee.stake(&proposer);
+                if stake >= self.committee.validity_threshold() {
                     break;
                 }
-                target_round -= 3;
             }
+        }
+        stake
+    }
+
+    fn indirect_inner_stake(
+        &self,
+        vertex: &Certificate,
+        leader_round: Round,
+        leader: PublicKey,
+        state: &State,
+    ) -> Stake {
+        let mut voters = HashSet::new();
+        let mut stake = 0;
+        for digest in &vertex.header.parents {
+            let parent = match Self::observed_certificate(digest, state) {
+                Some(parent) => parent,
+                None => continue,
+            };
+            let proposer = parent.origin();
+            if self.virtual_path_to_leader(parent, leader_round, leader, state)
+                && voters.insert(proposer)
+            {
+                stake += self.committee.stake(&proposer);
+                if stake >= self.committee.validity_threshold() {
+                    break;
+                }
+            }
+        }
+        stake
+    }
+
+    /// Indirect fallback votes are distinct round-(r+3) proposers in the
+    /// anchor's strong/weak causal history.
+    fn indirect_fallback_stake(
+        &self,
+        anchor: &Certificate,
+        target: Option<&Certificate>,
+        leader_round: Round,
+        leader: PublicKey,
+        state: &State,
+    ) -> Stake {
+        let history_round = leader_round + 3;
+        let mut pending: Vec<_> = anchor
+            .header
+            .parents
+            .iter()
+            .chain(&anchor.header.weak_edges)
+            .cloned()
+            .collect();
+        let mut visited = HashSet::new();
+        let mut voters = HashSet::new();
+        let mut stake = 0;
+
+        while let Some(digest) = pending.pop() {
+            if !visited.insert(digest.clone()) {
+                continue;
+            }
+            let vertex = match Self::observed_certificate(&digest, state) {
+                Some(vertex) => vertex,
+                None => continue,
+            };
+            if vertex.round() == history_round {
+                let strong = target.map_or(false, |target| {
+                    self.has_strong_path(vertex, &target.digest(), state)
+                });
+                let virtual_stake = self.indirect_inner_stake(vertex, leader_round, leader, state);
+                let proposer = vertex.origin();
+                if (strong || virtual_stake >= self.committee.validity_threshold())
+                    && voters.insert(proposer)
+                {
+                    stake += self.committee.stake(&proposer);
+                    if stake >= self.committee.validity_threshold() {
+                        break;
+                    }
+                }
+                continue;
+            }
+            if vertex.round() > history_round {
+                pending.extend(
+                    vertex
+                        .header
+                        .parents
+                        .iter()
+                        .chain(&vertex.header.weak_edges)
+                        .cloned(),
+                );
+            }
+        }
+        stake
+    }
+
+    fn fallback_history_complete(&self, anchor: &Certificate, state: &State) -> bool {
+        let mut pending: Vec<_> = anchor
+            .header
+            .parents
+            .iter()
+            .chain(&anchor.header.weak_edges)
+            .cloned()
+            .collect();
+        if anchor
+            .header
+            .virtual_edges
+            .iter()
+            .any(|digest| !state.observed.contains_key(digest))
+        {
+            return false;
+        }
+        let mut visited = HashSet::new();
+        while let Some(digest) = pending.pop() {
+            if !visited.insert(digest.clone()) {
+                continue;
+            }
+            let vertex = match Self::observed_certificate(&digest, state) {
+                Some(vertex) => vertex,
+                None => return false,
+            };
+            if vertex
+                .header
+                .virtual_edges
+                .iter()
+                .any(|digest| !state.observed.contains_key(digest))
+            {
+                return false;
+            }
+            pending.extend(
+                vertex
+                    .header
+                    .parents
+                    .iter()
+                    .chain(&vertex.header.weak_edges)
+                    .cloned(),
+            );
+        }
+        true
+    }
+
+    fn stage_leader_commit(&self, leader: Certificate, rule: u8, state: &mut State) {
+        let round = leader.round();
+        state.force_observed_history_to_dag(leader.clone(), round);
+        state.rule_three_stacks[(round % 3) as usize].remove(&round);
+        state.rule_three_recovery.remove(&round);
+        state.missing_leader_requests.remove(&round);
+        if let Some(_ready_at) = state.record_rule_ready(round) {
+            #[cfg(feature = "benchmark")]
+            info!(
+                "Leader commit-ready round {} digest {:?} at {}",
+                round,
+                leader.header.digest(),
+                _ready_at
+            );
+        }
+        state.leader_commit_rules.entry(round).or_insert(rule);
+        let ordered = self.order_dag(&leader, state);
+        #[cfg(feature = "benchmark")]
+        for certificate in &ordered {
+            if certificate.origin() != self.ordering_leader_authority(certificate.round())
+                && state
+                    .logged_rule_order
+                    .insert(certificate.header.digest(), certificate.round())
+                    .is_none()
+            {
+                info!(
+                    "Header rule-ordered round {} digest {:?}",
+                    certificate.round(),
+                    certificate.header.digest()
+                );
+            }
+        }
+        state.pending_order.insert(round, ordered);
+        state.pending_leaders.entry(round).or_insert(leader);
+        state.wake_pending(round);
+    }
+
+    /// Resolve one lane exactly as Algorithm 3's fallback stack: pop the
+    /// newest unresolved leader below the anchor, update the anchor only after
+    /// a commit, and leave it unchanged after a skip.
+    async fn finalize_fallback(&mut self, anchor_round: Round, state: &mut State) {
+        let lane = (anchor_round % 3) as usize;
+        let mut anchor = match self.observed_leader(anchor_round, state) {
+            Some(anchor) => anchor,
+            None => return,
+        };
+
+        let mut candidate = anchor.round().saturating_sub(3);
+        while candidate > 0 {
+            if !state.committed_leaders.contains(&candidate)
+                && !state.skipped_leaders.contains(&candidate)
+                && !state.pending_leaders.contains_key(&candidate)
+            {
+                state.rule_three_stacks[lane].insert(candidate);
+            }
+            if candidate < 3 {
+                break;
+            }
+            candidate -= 3;
+        }
+
+        loop {
+            let target_round = match state.rule_three_stacks[lane]
+                .range(..anchor.round())
+                .next_back()
+                .cloned()
+            {
+                Some(round) => round,
+                None => break,
+            };
+            if state.committed_leaders.contains(&target_round)
+                || state.skipped_leaders.contains(&target_round)
+                || state.pending_leaders.contains_key(&target_round)
+            {
+                state.rule_three_stacks[lane].remove(&target_round);
+                continue;
+            }
+            let leader = self.observed_leader(target_round, state);
+            if !self.fallback_history_complete(&anchor, state) {
+                if leader.is_none() {
+                    self.request_missing_leader(target_round, state).await;
+                }
+                break;
+            }
+            let leader_authority = self.ordering_leader_authority(target_round);
+            let commit = if anchor.round() <= target_round + 3 {
+                self.has_strong_path(&anchor, &leader.as_ref().unwrap().digest(), state)
+                    || self.direct_fallback_stake(&anchor, target_round, leader_authority, state)
+                        >= self.committee.validity_threshold()
+            } else {
+                self.indirect_fallback_stake(
+                    &anchor,
+                    leader.as_ref(),
+                    target_round,
+                    leader_authority,
+                    state,
+                ) >= self.committee.validity_threshold()
+            };
+
+            if commit {
+                let target = match leader {
+                    Some(target) => target,
+                    None => {
+                        self.request_missing_leader(target_round, state).await;
+                        break;
+                    }
+                };
+                sampled_debug!(
+                    target_round,
+                    "Leader {:?} marked commit-ready by fallback anchor round {}",
+                    target,
+                    anchor.round()
+                );
+                self.stage_leader_commit(target.clone(), 3, state);
+                anchor = target;
+                state.rule_three_anchors[lane] = Some(anchor.round());
+            } else {
+                sampled_debug!(
+                    target_round,
+                    "Skipping leader round {} by fallback anchor round {}",
+                    target_round,
+                    anchor.round()
+                );
+                self.mark_rule_three_skipped(target_round, state);
+            }
+        }
+        self.drain_ready_leaders(state).await;
+    }
+
+    async fn evaluate_fallback_anchors(&mut self, state: &mut State) {
+        let anchors: Vec<_> = state.rule_three_anchors.iter().flatten().cloned().collect();
+        for anchor in anchors {
+            self.finalize_fallback(anchor, state).await;
         }
     }
 
-    /// Re-evaluate only leaders whose inputs changed. A dirty target also
-    /// wakes the pending rule-3 observers in the same three-round chain.
-    async fn process_dirty_leaders(&mut self, state: &mut State) {
-        while !state.dirty_leaders.is_empty() {
-            let dirty: Vec<_> = state.dirty_leaders.drain().collect();
-            let mut rule_three_observers = HashSet::new();
+    #[cfg(test)]
+    async fn evaluate_commit_rule_three(&mut self, state: &mut State) {
+        self.evaluate_fallback_anchors(state).await;
+    }
 
+    /// Every newly observed or promoted piece of evidence can complete an old
+    /// strong/virtual predicate, so retry both the affected Good/Deferred
+    /// leaders and all three active fallback anchors.
+    async fn process_dirty_leaders(&mut self, state: &mut State) {
+        loop {
+            let dirty: Vec<_> = state.dirty_leaders.drain().collect();
             for leader_round in dirty {
                 if !state.committed_leaders.contains(&leader_round)
                     && !state.skipped_leaders.contains(&leader_round)
@@ -1578,20 +1564,10 @@ impl Consensus {
                     self.evaluate_commit_rule_one(leader_round + 1, state).await;
                     self.evaluate_commit_rule_two(leader_round + 2, state).await;
                 }
-
-                let stack = &state.rule_three_stacks[(leader_round % 3) as usize];
-                rule_three_observers.extend(stack.range((leader_round + 3)..).cloned());
-                if state.pending_leaders.contains_key(&leader_round) {
-                    rule_three_observers.insert(leader_round);
-                }
             }
-
-            if !rule_three_observers.is_empty() {
-                self.evaluate_commit_rule_three_for(
-                    rule_three_observers.into_iter().collect(),
-                    state,
-                )
-                .await;
+            self.evaluate_fallback_anchors(state).await;
+            if state.dirty_leaders.is_empty() {
+                break;
             }
         }
     }
@@ -1635,6 +1611,11 @@ impl Consensus {
     }
 
     async fn request_missing_leader(&mut self, round: Round, state: &mut State) {
+        if state.skipped_leaders.contains(&round) || self.observed_leader(round, state).is_some() {
+            state.rule_three_recovery.remove(&round);
+            state.missing_leader_requests.remove(&round);
+            return;
+        }
         if !state.rule_three_recovery.insert(round) {
             return;
         }
@@ -1652,14 +1633,19 @@ impl Consensus {
             .filter_map(|(round, deadline)| (*deadline <= now).then_some(*round))
             .collect();
         for round in rounds {
-            // Removing the deadline before sending makes this the only retry.
-            state.missing_leader_requests.remove(&round);
-            if state.rule_three_recovery.contains(&round)
-                && self.observed_leader(round, state).is_none()
+            if state.skipped_leaders.contains(&round)
+                || self.observed_leader(round, state).is_some()
+                || !state.rule_three_recovery.contains(&round)
             {
-                sampled_debug!(round, "Retrying request for missing leader round {}", round);
-                self.send_leader_request(round).await;
+                state.rule_three_recovery.remove(&round);
+                state.missing_leader_requests.remove(&round);
+                continue;
             }
+            sampled_debug!(round, "Retrying request for missing leader round {}", round);
+            self.send_leader_request(round).await;
+            state
+                .missing_leader_requests
+                .insert(round, Instant::now() + LEADER_RETRY_DELAY);
         }
     }
 
@@ -1708,45 +1694,18 @@ impl Consensus {
         if state.committed_leaders.contains(&round) || state.skipped_leaders.contains(&round) {
             return;
         }
-        // Entering pending authorizes early, verified GRBC data for the leader
-        // and its complete causal history to be inserted directly into Dag.
-        state.force_observed_history_to_dag(leader.clone(), round);
-        if let Some(_ready_at) = state.record_rule_ready(round) {
-            #[cfg(feature = "benchmark")]
-            info!(
-                "Leader commit-ready round {} digest {:?} at {}",
-                round,
-                leader.header.digest(),
-                _ready_at
-            );
-        }
-        state.leader_commit_rules.entry(round).or_insert(rule);
-        let ordered = self.order_dag(&leader, state);
-        #[cfg(feature = "benchmark")]
-        for certificate in &ordered {
-            if certificate.origin() != self.ordering_leader_authority(certificate.round())
-                && state
-                    .logged_rule_order
-                    .insert(certificate.header.digest(), certificate.round())
-                    .is_none()
-            {
-                info!(
-                    "Header rule-ordered round {} digest {:?}",
-                    certificate.round(),
-                    certificate.header.digest()
-                );
+        // A Good/Deferred leader is the only valid initial recovery anchor.
+        // Force its strong/weak causal history before deciding any stack item.
+        if rule == 1 || rule == 2 {
+            state.force_observed_history_to_dag(leader.clone(), round);
+            let lane = (round % 3) as usize;
+            if state.rule_three_anchors[lane].map_or(true, |previous| round > previous) {
+                state.rule_three_anchors[lane] = Some(round);
             }
+            let anchor_round = state.rule_three_anchors[lane].unwrap();
+            self.finalize_fallback(anchor_round, state).await;
         }
-        state.pending_order.insert(round, ordered);
-        if let std::collections::btree_map::Entry::Vacant(entry) =
-            state.pending_leaders.entry(round)
-        {
-            entry.insert(leader);
-            state.rule_three_stacks[(round % 3) as usize].insert(round);
-            state.dirty_leaders.insert(round);
-        }
-        state.wake_pending(round);
-
+        self.stage_leader_commit(leader, rule, state);
         self.drain_ready_leaders(state).await;
     }
 

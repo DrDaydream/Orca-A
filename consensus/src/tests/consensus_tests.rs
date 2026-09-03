@@ -159,7 +159,7 @@ async fn higher_round_jump_checks_each_crossed_round_once() {
 }
 
 #[tokio::test]
-async fn missing_leader_request_retries_once_after_300_ms() {
+async fn missing_leader_request_keeps_retrying_after_300_ms() {
     let committee = mock_committee();
     let (tx_primary, mut rx_primary) = channel(10);
     let mut consensus = Consensus {
@@ -190,7 +190,67 @@ async fn missing_leader_request_retries_once_after_300_ms() {
 
     consensus.retry_missing_leaders(&mut state).await;
     assert!(rx_primary.try_recv().is_err());
+    assert!(state.missing_leader_requests.contains_key(&2));
+
+    tokio::time::sleep(LEADER_RETRY_DELAY + Duration::from_millis(20)).await;
+    consensus.retry_missing_leaders(&mut state).await;
+    assert!(matches!(
+        rx_primary.recv().await,
+        Some(ConsensusCommand::LeaderRequest(2, _))
+    ));
+}
+
+#[tokio::test]
+async fn skipped_leader_cancels_recovery_and_retries() {
+    let committee = mock_committee();
+    let (tx_primary, mut rx_primary) = channel(10);
+    let mut consensus = Consensus {
+        committee: committee.clone(),
+        gc_depth: 50,
+        rx_primary: channel(1).1,
+        tx_primary,
+        tx_output: OutputSender::Individual(channel(10).0),
+        genesis: Certificate::genesis(&committee),
+    };
+    let mut state = State::new(Certificate::genesis(&committee));
+
+    consensus.request_missing_leader(2, &mut state).await;
+    assert!(rx_primary.recv().await.is_some());
+    consensus.mark_rule_three_skipped(2, &mut state);
+    assert!(!state.rule_three_recovery.contains(&2));
     assert!(!state.missing_leader_requests.contains_key(&2));
+
+    consensus.request_missing_leader(2, &mut state).await;
+    assert!(rx_primary.try_recv().is_err());
+}
+
+#[test]
+fn skipped_leader_vertex_can_still_be_force_admitted_as_causal_history() {
+    let committee = mock_committee();
+    let consensus = Consensus {
+        committee: committee.clone(),
+        gc_depth: 50,
+        rx_primary: channel(1).1,
+        tx_primary: channel(10).0,
+        tx_output: OutputSender::Individual(channel(10).0),
+        genesis: Certificate::genesis(&committee),
+    };
+    let mut state = State::new(Certificate::genesis(&committee));
+    let authorities: Vec<_> = keys().into_iter().map(|(key, _)| key).collect();
+    let (skipped_digest, skipped) =
+        mock_certificate(consensus.ordering_leader_authority(1), 1, BTreeSet::new());
+    state.observe(skipped);
+    consensus.mark_rule_three_skipped(1, &mut state);
+
+    let (_, root) = mock_certificate(
+        authorities[0],
+        2,
+        [skipped_digest.clone()].iter().cloned().collect(),
+    );
+    state.force_observed_history_to_dag(root, 2);
+
+    assert!(state.skipped_leaders.contains(&1));
+    assert!(state.dag_digests.contains(&skipped_digest));
 }
 
 #[test]
@@ -516,6 +576,22 @@ fn commit_ready_leader_promotes_from_observe_with_strong_and_weak_history() {
 }
 
 #[test]
+fn force_admission_does_not_follow_virtual_edges() {
+    let committee = mock_committee();
+    let mut state = State::new(Certificate::genesis(&committee));
+    let authorities: Vec<_> = keys().into_iter().map(|(key, _)| key).collect();
+    let (virtual_digest, virtual_block) = mock_certificate(authorities[1], 1, BTreeSet::new());
+    state.observe(virtual_block);
+
+    let (_, mut root) = mock_certificate(authorities[0], 2, BTreeSet::new());
+    root.header.virtual_edges.insert(virtual_digest.clone());
+    root.header.id = root.header.digest();
+    state.force_observed_history_to_dag(root, 2);
+
+    assert!(!state.dag_digests.contains(&virtual_digest));
+}
+
+#[test]
 fn commit_rule_two_counts_strong_and_two_hop_virtual_paths() {
     let committee = mock_committee();
     let consensus = Consensus {
@@ -583,7 +659,7 @@ fn rule_two_does_not_count_locally_present_unreferenced_leader() {
 }
 
 #[test]
-fn commit_rule_three_counts_exact_three_edge_virtual_paths() {
+fn direct_fallback_counts_each_anchor_parent_once() {
     let committee = mock_committee();
     let consensus = Consensus {
         committee: committee.clone(),
@@ -609,8 +685,8 @@ fn commit_rule_three_counts_exact_three_edge_virtual_paths() {
         state.promote_to_dag(second);
     }
 
-    // The same round-3 block points to both round-2 blocks. These are two
-    // distinct paths because their second intermediate blocks differ.
+    // The same anchor parent points to both round-2 blocks. It is one vote,
+    // irrespective of how many qualifying virtual paths it carries.
     let second_parents = second_digests.into_iter().collect();
     let (first_digest, first) = mock_certificate(authorities[0], 3, second_parents);
     state.promote_to_dag(first);
@@ -618,13 +694,13 @@ fn commit_rule_three_counts_exact_three_edge_virtual_paths() {
     let (_, higher) = mock_certificate(authorities[3], 4, first_digests);
 
     assert_eq!(
-        consensus.three_edge_virtual_path_stake(&higher, &lower_digest, &state),
-        committee.validity_threshold()
+        consensus.direct_fallback_stake(&higher, 1, authorities[0], &state),
+        committee.stake(&authorities[0])
     );
 }
 
 #[test]
-fn commit_rule_three_paths_are_distinct_when_first_intermediate_differs() {
+fn direct_fallback_counts_distinct_anchor_parent_proposers() {
     let committee = mock_committee();
     let consensus = Consensus {
         committee: committee.clone(),
@@ -653,7 +729,7 @@ fn commit_rule_three_paths_are_distinct_when_first_intermediate_differs() {
     }
     let (_, higher) = mock_certificate(authorities[3], 4, first_digests);
     assert_eq!(
-        consensus.three_edge_virtual_path_stake(&higher, &lower_digest, &state),
+        consensus.direct_fallback_stake(&higher, 1, authorities[0], &state),
         committee.validity_threshold()
     );
 }
@@ -691,6 +767,8 @@ async fn rule_three_requests_a_leader_without_any_observed_certificate() {
     higher.header.id = higher.header.digest();
     state.promote_to_dag(higher.clone());
     state.pending_leaders.insert(4, higher);
+    state.rule_three_stacks[1].insert(1);
+    state.rule_three_anchors[1] = Some(4);
 
     consensus.evaluate_commit_rule_three(&mut state).await;
     assert!(!state.skipped_leaders.contains(&1));
@@ -724,6 +802,8 @@ async fn rule_three_skips_locally_known_leader_not_referenced_by_observer_histor
     state.observe(observer.clone());
     state.promote_to_dag(observer.clone());
     state.pending_leaders.insert(4, observer);
+    state.rule_three_stacks[1].insert(1);
+    state.rule_three_anchors[1] = Some(4);
 
     consensus.evaluate_commit_rule_three(&mut state).await;
 
@@ -732,7 +812,7 @@ async fn rule_three_skips_locally_known_leader_not_referenced_by_observer_histor
 }
 
 #[tokio::test]
-async fn rule_three_bridges_missing_leader_with_f_plus_one_history_blocks() {
+async fn fallback_does_not_jump_over_a_missing_stack_entry() {
     let committee = mock_committee();
     let (tx_primary, _rx_primary) = channel(20);
     let (tx_output, _rx_output) = channel(20);
@@ -772,8 +852,10 @@ async fn rule_three_bridges_missing_leader_with_f_plus_one_history_blocks() {
     let (b5_digest, b5) =
         mock_certificate(authorities[2], 5, [b4_digest].iter().cloned().collect());
     state.observe(b5);
-    let (b6_digest, b6) =
-        mock_certificate(authorities[3], 6, [b5_digest].iter().cloned().collect());
+    let (_, mut b6) = mock_certificate(authorities[3], 6, [b5_digest].iter().cloned().collect());
+    b6.header.weak_edges.insert(Digest::default());
+    b6.header.id = b6.header.digest();
+    let b6_digest = b6.digest();
     state.observe(b6);
 
     let (_, higher) = mock_certificate(
@@ -784,15 +866,18 @@ async fn rule_three_bridges_missing_leader_with_f_plus_one_history_blocks() {
     state.observe(higher.clone());
     state.promote_to_dag(higher.clone());
     state.pending_leaders.insert(7, higher);
+    state.rule_three_stacks[1].extend([1, 4]);
+    state.rule_three_anchors[1] = Some(7);
 
     consensus.evaluate_commit_rule_three(&mut state).await;
 
-    assert!(state.skipped_leaders.contains(&4));
-    assert!(state.committed_leaders.contains(&1));
+    assert!(!state.skipped_leaders.contains(&4));
+    assert!(!state.committed_leaders.contains(&1));
+    assert!(state.rule_three_recovery.contains(&4));
 }
 
 #[tokio::test]
-async fn rule_three_bridges_two_consecutive_missing_leaders() {
+async fn fallback_requests_only_the_newest_missing_stack_entry() {
     let committee = mock_committee();
     let (tx_primary, mut rx_primary) = channel(20);
     let (tx_output, _rx_output) = channel(20);
@@ -829,21 +914,28 @@ async fn rule_three_bridges_two_consecutive_missing_leaders() {
         parent = digest;
     }
 
-    let (_, observer) = mock_certificate(
+    let (_, mut observer) = mock_certificate(
         consensus.ordering_leader_authority(10),
         10,
         [parent].iter().cloned().collect(),
     );
+    observer.header.weak_edges.insert(Digest::default());
+    observer.header.id = observer.header.digest();
     state.observe(observer.clone());
     state.promote_to_dag(observer.clone());
     state.pending_leaders.insert(10, observer);
+    state.rule_three_stacks[1].extend([1, 4, 7]);
+    state.rule_three_anchors[1] = Some(10);
 
     consensus.evaluate_commit_rule_three(&mut state).await;
 
-    assert!(state.skipped_leaders.contains(&7));
-    assert!(state.skipped_leaders.contains(&4));
-    assert!(state.committed_leaders.contains(&1));
-    assert!(rx_primary.try_recv().is_err());
+    assert!(!state.skipped_leaders.contains(&7));
+    assert!(!state.skipped_leaders.contains(&4));
+    assert!(!state.committed_leaders.contains(&1));
+    assert!(matches!(
+        rx_primary.try_recv(),
+        Ok(ConsensusCommand::LeaderRequest(7, _))
+    ));
 }
 
 #[tokio::test]

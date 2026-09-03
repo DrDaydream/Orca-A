@@ -493,6 +493,48 @@ impl Core {
 
     /// Grade-2 delivery is local and immediate, but a block contributes to the
     /// strong-parent quorum only after all strong and weak dependencies exist.
+    fn select_weak_edges(&self, parents: &[Digest], round: Round) -> Vec<Digest> {
+        let mut reachable = HashSet::new();
+        let mut pending = parents.to_vec();
+        while let Some(digest) = pending.pop() {
+            if !reachable.insert(digest.clone()) {
+                continue;
+            }
+            if let Some(certificate) = self
+                .grbc_certificates
+                .get(&digest)
+                .or_else(|| self.grade_one_certificates.get(&digest))
+            {
+                pending.extend(
+                    certificate
+                        .header
+                        .parents
+                        .iter()
+                        .chain(&certificate.header.weak_edges)
+                        .cloned(),
+                );
+            }
+        }
+
+        let max_weak = self.committee.size().saturating_sub(1) / 3;
+        let mut candidates: Vec<_> = self
+            .weak_edge_candidates
+            .iter()
+            .filter(|(digest, block_round)| **block_round < round && !reachable.contains(*digest))
+            .filter_map(|(digest, block_round)| {
+                self.grbc_certificates
+                    .get(digest)
+                    .map(|certificate| (*block_round, certificate.origin(), digest.clone()))
+            })
+            .collect();
+        candidates.sort();
+        candidates
+            .into_iter()
+            .take(max_weak)
+            .map(|(_, _, digest)| digest)
+            .collect()
+    }
+
     async fn try_advance_grade_two(&mut self, certificate: Certificate) -> DagResult<()> {
         if !self
             .synchronizer
@@ -519,12 +561,7 @@ impl Core {
                 })
                 .map(|(digest, _)| digest.clone())
                 .collect();
-            let weak_edges: Vec<_> = self
-                .weak_edge_candidates
-                .iter()
-                .filter(|(_, block_round)| **block_round < round)
-                .map(|(digest, _)| digest.clone())
-                .collect();
+            let weak_edges = self.select_weak_edges(&parents, round);
             for digest in &parents {
                 self.weak_edge_candidates.remove(digest);
             }
