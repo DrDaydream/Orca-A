@@ -76,7 +76,7 @@ async fn process_header() {
     // Ensure the listener correctly received the vote.
     let received = handle.await.unwrap();
     match bincode::deserialize(&received).unwrap() {
-        PrimaryMessage::GradeOneVote(x) => assert_eq!(x, expected),
+        PrimaryMessage::GradeOneVoteBatch(votes) => assert_eq!(votes, vec![expected]),
         x => panic!("Unexpected message: {:?}", x),
     }
 

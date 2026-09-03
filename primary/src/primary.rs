@@ -33,6 +33,7 @@ pub type Round = u64;
 pub enum PrimaryMessage {
     Header(Header),
     GradeOneVote(GradeOneVote),
+    GradeOneVoteBatch(Vec<GradeOneVote>),
     Certificate(Certificate),
     LeaderRequest(Round, PublicKey, /* requestor */ PublicKey),
     CertificatesRequest(Vec<Digest>, /* requestor */ PublicKey),
