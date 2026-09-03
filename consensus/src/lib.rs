@@ -1495,9 +1495,10 @@ impl Consensus {
             }
             let leader_authority = self.ordering_leader_authority(target_round);
             let commit = if anchor.round() <= target_round + 3 {
-                self.has_strong_path(&anchor, &leader.as_ref().unwrap().digest(), state)
-                    || self.direct_fallback_stake(&anchor, target_round, leader_authority, state)
-                        >= self.committee.validity_threshold()
+                leader.as_ref().map_or(false, |target| {
+                    self.has_strong_path(&anchor, &target.digest(), state)
+                }) || self.direct_fallback_stake(&anchor, target_round, leader_authority, state)
+                    >= self.committee.validity_threshold()
             } else {
                 self.indirect_fallback_stake(
                     &anchor,
@@ -1702,7 +1703,7 @@ impl Consensus {
             if state.rule_three_anchors[lane].map_or(true, |previous| round > previous) {
                 state.rule_three_anchors[lane] = Some(round);
             }
-            let anchor_round = state.rule_three_anchors[lane].unwrap();
+            let anchor_round = state.rule_three_anchors[lane].unwrap_or(round);
             self.finalize_fallback(anchor_round, state).await;
         }
         self.stage_leader_commit(leader, rule, state);

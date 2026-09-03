@@ -781,6 +781,36 @@ async fn rule_three_requests_a_leader_without_any_observed_certificate() {
 }
 
 #[tokio::test]
+async fn direct_fallback_skips_missing_leader_when_complete_history_has_no_vote() {
+    let committee = mock_committee();
+    let (tx_primary, mut rx_primary) = channel(10);
+    let mut consensus = Consensus {
+        committee: committee.clone(),
+        gc_depth: 50,
+        rx_primary: channel(1).1,
+        tx_primary,
+        tx_output: OutputSender::Individual(channel(10).0),
+        genesis: Certificate::genesis(&committee),
+    };
+    let mut state = State::new(Certificate::genesis(&committee));
+
+    // The direct anchor has a complete, empty causal view. The round-1
+    // leader is absent and receives no strong or virtual fallback vote.
+    let (_, anchor) = mock_certificate(consensus.ordering_leader_authority(4), 4, BTreeSet::new());
+    state.observe(anchor.clone());
+    state.promote_to_dag(anchor);
+    state.rule_three_stacks[1].insert(1);
+    state.rule_three_anchors[1] = Some(4);
+
+    consensus.evaluate_commit_rule_three(&mut state).await;
+
+    assert!(state.skipped_leaders.contains(&1));
+    assert!(!state.rule_three_recovery.contains(&1));
+    assert!(!state.missing_leader_requests.contains_key(&1));
+    assert!(rx_primary.try_recv().is_err());
+}
+
+#[tokio::test]
 async fn rule_three_skips_locally_known_leader_not_referenced_by_observer_history() {
     let committee = mock_committee();
     let (tx_primary, _rx_primary) = channel(10);
