@@ -8,7 +8,9 @@ use std::cmp::max;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::{self, Receiver, Sender};
-use tokio::time::{self, Duration};
+use tokio::time::{self, Duration, Instant};
+
+const LEADER_RETRY_DELAY: Duration = Duration::from_millis(300);
 
 /// Keep diagnostic logging deterministic while cutting its hot-path volume in
 /// half. Benchmark `info!` records and all warnings/errors remain unsampled.
@@ -98,7 +100,8 @@ struct State {
     rule_three_stacks: [BTreeSet<Round>; 3],
     /// Rule-3 leaders whose data is being recovered from GRBC/other nodes.
     rule_three_recovery: HashSet<Round>,
-    missing_leader_requests: HashSet<Round>,
+    /// Missing leaders awaiting their single retry, indexed by retry deadline.
+    missing_leader_requests: HashMap<Round, Instant>,
     /// Causal-history digests authorized by a successful rule-3 recovery but
     /// not observed locally yet, mapped to the leader rounds they unblock.
     forced_history_waiters: HashMap<Digest, HashSet<Round>>,
@@ -185,7 +188,7 @@ impl State {
             ready_pending: BTreeSet::new(),
             rule_three_stacks: [BTreeSet::new(), BTreeSet::new(), BTreeSet::new()],
             rule_three_recovery: HashSet::new(),
-            missing_leader_requests: HashSet::new(),
+            missing_leader_requests: HashMap::new(),
             forced_history_waiters: HashMap::new(),
             dirty_leaders: HashSet::new(),
             highest_advanced_round: 1,
@@ -746,20 +749,27 @@ impl Consensus {
             }
         });
 
-        // Retry recovery requests: a peer may not yet have observed the leader
-        // when the first request reaches it.
-        let mut recovery_tick = time::interval(Duration::from_secs(1));
-        recovery_tick.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+        let mut diagnostic_tick = time::interval(Duration::from_secs(1));
+        diagnostic_tick.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
 
         // Listen to incoming certificates and recovery timers.
         loop {
+            let next_leader_retry = state.missing_leader_requests.values().min().copied();
             let message = tokio::select! {
                 message = rx_ingress.recv() => match message {
                     Some(message) => message,
                     None => break,
                 },
-                _ = recovery_tick.tick() => {
-                    self.retry_missing_leaders(&state).await;
+                _ = async {
+                    match next_leader_retry {
+                        Some(deadline) => time::sleep_until(deadline).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    self.retry_missing_leaders(&mut state).await;
+                    continue;
+                }
+                _ = diagnostic_tick.tick() => {
                     self.log_pending_blockers(&state);
                     continue;
                 }
@@ -1337,18 +1347,11 @@ impl Consensus {
                     if target.is_none() {
                         sampled_debug!(
                             target_round,
-                            "Skipping absent leader round {} during rule-3 backtracking",
+                            "Requesting absent leader round {} during rule-3 backtracking",
                             target_round
                         );
-                        self.mark_rule_three_skipped(target_round, state);
-                        state.rule_three_recovery.remove(&target_round);
-                        state.missing_leader_requests.remove(&target_round);
-                        self.drain_ready_leaders(state).await;
-                        if target_round < 4 {
-                            break;
-                        }
-                        target_round -= 3;
-                        continue;
+                        self.request_missing_leader(target_round, state).await;
+                        break;
                     }
                     let observer = self.observed_leader(observer_round, state);
                     let target_digest = target.as_ref().unwrap().digest();
@@ -1550,10 +1553,29 @@ impl Consensus {
             .expect("Failed to request rule-3 leader");
     }
 
-    async fn retry_missing_leaders(&mut self, state: &State) {
-        let rounds: Vec<_> = state.missing_leader_requests.iter().cloned().collect();
+    async fn request_missing_leader(&mut self, round: Round, state: &mut State) {
+        if !state.rule_three_recovery.insert(round) {
+            return;
+        }
+        self.send_leader_request(round).await;
+        state
+            .missing_leader_requests
+            .insert(round, Instant::now() + LEADER_RETRY_DELAY);
+    }
+
+    async fn retry_missing_leaders(&mut self, state: &mut State) {
+        let now = Instant::now();
+        let rounds: Vec<_> = state
+            .missing_leader_requests
+            .iter()
+            .filter_map(|(round, deadline)| (*deadline <= now).then_some(*round))
+            .collect();
         for round in rounds {
-            if self.observed_leader(round, state).is_none() {
+            // Removing the deadline before sending makes this the only retry.
+            state.missing_leader_requests.remove(&round);
+            if state.rule_three_recovery.contains(&round)
+                && self.observed_leader(round, state).is_none()
+            {
                 sampled_debug!(round, "Retrying request for missing leader round {}", round);
                 self.send_leader_request(round).await;
             }
@@ -1878,11 +1900,17 @@ impl Consensus {
         while let Some(x) = buffer.pop() {
             sampled_debug!(x.round(), "Sequencing {:?}", x);
             ordered.push(x.clone());
-            // Strong parents point to the preceding round, while weak parents
-            // may cross several rounds. Both belong to the committed causal
-            // history and must be ordered; virtual edges are intentionally not
-            // traversed here.
-            for parent in x.header.parents.iter().chain(&x.header.weak_edges) {
+            // Strong, weak, and virtual references all belong to the causal
+            // history authorized by the committed leader. Commit readiness
+            // force-admits verified virtual ancestors into `dag_by_digest`, so
+            // the same traversal safely orders all three edge classes.
+            for parent in x
+                .header
+                .parents
+                .iter()
+                .chain(&x.header.weak_edges)
+                .chain(&x.header.virtual_edges)
+            {
                 let certificate = match state.dag_by_digest.get(parent) {
                     Some(certificate) => certificate,
                     None => continue, // We already ordered or GC up to here.

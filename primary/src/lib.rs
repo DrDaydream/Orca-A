@@ -18,7 +18,5 @@ mod synchronizer;
 #[path = "tests/common.rs"]
 mod common;
 
-pub use crate::messages::{
-    Certificate, ConsensusCommand, ConsensusMessage, Grade, GradeVote, GradedCertificate, Header,
-};
+pub use crate::messages::{Certificate, ConsensusCommand, ConsensusMessage, GradeOneVote, Header};
 pub use crate::primary::{Primary, PrimaryWorkerMessage, Round, WorkerPrimaryMessage};

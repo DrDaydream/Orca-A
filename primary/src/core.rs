@@ -1,23 +1,20 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-use crate::aggregators::{CertificatesAggregator, GradeVotesAggregator, VotesAggregator};
+use crate::aggregators::{CertificatesAggregator, GradeOneVotesAggregator};
 use crate::error::{DagError, DagResult};
-use crate::messages::{
-    Certificate, ConsensusCommand, ConsensusMessage, GradeVote, GradedCertificate, Header, Vote,
-};
+use crate::messages::{Certificate, ConsensusCommand, ConsensusMessage, GradeOneVote, Header};
 use crate::primary::{PrimaryMessage, Round};
 use crate::proposer::ProposerMessage;
 use crate::synchronizer::Synchronizer;
 use async_recursion::async_recursion;
 use bytes::Bytes;
-use config::{Committee, Stake};
+use config::Committee;
 use crypto::Hash as _;
-use crypto::{Digest, PublicKey, SignatureService};
+use crypto::{Digest, PublicKey, Signature, SignatureService};
 use log::{debug, error, trace, warn};
 use network::{CancelHandler, ReliableSender};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{channel as work_channel, Sender as WorkSender};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use store::Store;
 use tokio::sync::mpsc::{Receiver, Sender};
 
@@ -62,23 +59,17 @@ pub struct Core {
     /// The set of headers we are currently processing.
     processing: HashMap<Round, HashSet<Digest>>,
     /// Every node aggregates votes for every observed header.
-    votes_aggregators: HashMap<Digest, VotesAggregator>,
+    votes_aggregators: HashMap<Digest, GradeOneVotesAggregator>,
     /// Valid votes that arrived before their header.
-    pending_votes: HashMap<Digest, Vec<Vote>>,
+    pending_votes: HashMap<Digest, Vec<GradeOneVote>>,
     /// Aggregates certificates to use as parents for new headers.
     certificates_aggregators: HashMap<Round, Box<CertificatesAggregator>>,
-    /// Certificates delivered at GRBC grade 1, indexed by their digest.
+    /// One-vote certificates delivered locally at GRBC grade 1.
+    grade_one_certificates: HashMap<Digest, Certificate>,
+    /// Quorum certificates delivered at GRBC grade 2.
     grbc_certificates: HashMap<Digest, Certificate>,
     /// Valid author-signed headers seen before any certificate/grade forms.
     observed_headers: HashMap<Digest, Header>,
-    /// Grade-1 acknowledgements collected by the certificate origin.
-    grade_aggregators: HashMap<Digest, GradeVotesAggregator>,
-    /// Valid READY/grade-1 messages that arrived before their certificate.
-    pending_grade_votes: HashMap<Digest, Vec<GradeVote>>,
-    /// Unique READY senders and bound metadata used by the f+1 relay rule.
-    ready_support: HashMap<Digest, (Round, PublicKey, HashSet<PublicKey>, Stake)>,
-    /// Certificates for which this primary already emitted a grade vote.
-    grade_voted: HashSet<Digest>,
     /// Certificates carrying a verified grade-2 proof.
     grade_two: HashSet<Digest>,
     /// Grade-2 blocks waiting for weak causal dependencies before they may
@@ -132,12 +123,9 @@ impl Core {
                 votes_aggregators: HashMap::new(),
                 pending_votes: HashMap::new(),
                 certificates_aggregators: HashMap::with_capacity(2 * gc_depth as usize),
+                grade_one_certificates: HashMap::new(),
                 grbc_certificates: HashMap::new(),
                 observed_headers: HashMap::new(),
-                grade_aggregators: HashMap::new(),
-                pending_grade_votes: HashMap::new(),
-                ready_support: HashMap::new(),
-                grade_voted: HashSet::new(),
                 grade_two: HashSet::new(),
                 round_advance_pending: HashMap::new(),
                 weak_edge_candidates: HashMap::new(),
@@ -163,7 +151,9 @@ impl Core {
 
         if let Some(votes) = self.pending_votes.remove(&header.id) {
             for vote in votes {
-                self.process_vote(vote).await.expect("Invalid pending vote");
+                self.process_grade_one_vote(vote)
+                    .await
+                    .expect("Invalid pending vote");
             }
         }
     }
@@ -319,7 +309,7 @@ impl Core {
         {
             // Ordinary VOTE is an all-to-all GRBC message. Every node can
             // therefore collect a quorum and form the certificate locally.
-            let vote = Vote::new(header, &self.name, &mut self.signature_service).await;
+            let vote = GradeOneVote::new(header, &self.name, &mut self.signature_service).await;
             debug!("Created {:?}", vote);
             let addresses = self
                 .committee
@@ -327,14 +317,14 @@ impl Core {
                 .iter()
                 .map(|(_, authority)| authority.primary_to_primary)
                 .collect();
-            let bytes = bincode::serialize(&PrimaryMessage::Vote(vote.clone()))
+            let bytes = bincode::serialize(&PrimaryMessage::GradeOneVote(vote.clone()))
                 .expect("Failed to serialize GRBC vote");
             let handlers = self.network.broadcast(addresses, Bytes::from(bytes)).await;
             self.cancel_handlers
                 .entry(header.round)
                 .or_insert_with(Vec::new)
                 .extend(handlers);
-            self.process_vote(vote).await?;
+            self.process_grade_one_vote(vote).await?;
         }
         // A HeaderWaiter loopback also signals that optional weak references
         // requested earlier may now be stored. Recheck only the Grade-2 blocks
@@ -344,7 +334,7 @@ impl Core {
     }
 
     #[async_recursion]
-    async fn process_vote(&mut self, vote: Vote) -> DagResult<()> {
+    async fn process_grade_one_vote(&mut self, vote: GradeOneVote) -> DagResult<()> {
         debug!("Processing {:?}", vote);
 
         let header = match self.observed_headers.get(&vote.id).cloned() {
@@ -364,11 +354,18 @@ impl Core {
             }
         };
 
-        // Add it to the votes' aggregator and try to make a new certificate.
+        ensure!(
+            vote.round == header.round && vote.origin == header.author,
+            DagError::UnexpectedGradeOneVote(vote.id.clone())
+        );
+        self.deliver_grade_one(&header, vote.author, vote.signature.clone())
+            .await;
+
+        // A quorum of grade-1 votes is the grade-2 certificate.
         if let Some(certificate) = self
             .votes_aggregators
             .entry(header.id.clone())
-            .or_insert_with(VotesAggregator::new)
+            .or_insert_with(GradeOneVotesAggregator::new)
             .append(vote, &self.committee, &header)?
         {
             debug!("Assembled {:?}", certificate);
@@ -394,6 +391,29 @@ impl Core {
                 .expect("Failed to process valid certificate");
         }
         Ok(())
+    }
+
+    async fn deliver_grade_one(
+        &mut self,
+        header: &Header,
+        author: PublicKey,
+        signature: Signature,
+    ) {
+        let certificate = Certificate {
+            header: header.clone(),
+            votes: vec![(author, signature)],
+        };
+        let digest = certificate.digest();
+        if self
+            .grade_one_certificates
+            .insert(digest, certificate.clone())
+            .is_none()
+        {
+            self.tx_consensus
+                .send(ConsensusMessage::GradeOne(certificate))
+                .await
+                .expect("Failed to send grade-1 block to consensus");
+        }
     }
 
     #[async_recursion]
@@ -430,150 +450,38 @@ impl Core {
 
         let digest = certificate.digest();
 
-        // A looped-back or retransmitted certificate must not be delivered twice.
-        if self.grbc_certificates.contains_key(&digest) {
-            // The certificate waiter also loops Grade-2 blocks back once weak
-            // dependencies arrive. GRBC delivery is already complete, but the
-            // block may now become eligible for round advancement.
-            if self.grade_two.contains(&digest) {
-                self.try_advance_grade_two(certificate).await?;
-            }
+        // A looped-back Grade-2 certificate may now have all dependencies.
+        if self.grade_two.contains(&digest) {
+            self.try_advance_grade_two(certificate).await?;
             self.retry_round_advance_pending().await?;
             return Ok(());
         }
 
-        // Store the certificate. This is the grade-1 delivery point of GRBC.
+        // A remotely assembled certificate can arrive before this node emits
+        // its own vote. Preserve the Grade-1-before-Grade-2 event order.
+        if !self.grade_one_certificates.contains_key(&digest) {
+            if let Some((author, signature)) = certificate.votes.first() {
+                self.deliver_grade_one(&certificate.header, *author, signature.clone())
+                    .await;
+            }
+        }
+
+        // The quorum certificate is the Grade-2 proof.
         let bytes = bincode::serialize(&certificate).expect("Failed to serialize certificate");
         self.store.write(digest.to_vec(), bytes).await;
         self.grbc_certificates
             .insert(digest.clone(), certificate.clone());
-
-        // Grade 1 enters VDag only; it is not inserted into Tusk's Dag yet.
-        let id = certificate.header.id.clone();
-        if let Err(e) = self
-            .tx_consensus
-            .send(ConsensusMessage::GradeOne(certificate.clone()))
-            .await
-        {
-            warn!(
-                "Failed to deliver certificate {} to the consensus: {}",
-                id, e
-            );
-        }
-
-        // Grade-1 is the READY step of GRBC. Every node broadcasts its READY,
-        // then locally delivers grade 2 after collecting a quorum. Deliver is
-        // a local event and is never broadcast again.
-        if self.grade_voted.insert(digest) {
-            let vote = GradeVote::new(&certificate, &self.name, &mut self.signature_service).await;
-            self.broadcast_grade_vote(&vote).await;
-            self.process_grade_vote(vote).await?;
-        }
-
-        // READY messages may race ahead of the certificate over independent
-        // network connections. They were signature-checked on arrival.
-        if let Some(votes) = self.pending_grade_votes.remove(&certificate.digest()) {
-            for vote in votes {
-                self.process_grade_vote(vote).await?;
-            }
-        }
-        self.retry_round_advance_pending().await?;
-        Ok(())
-    }
-
-    async fn broadcast_grade_vote(&mut self, vote: &GradeVote) {
-        let addresses = self
-            .committee
-            .others_primaries(&self.name)
-            .iter()
-            .map(|(_, authority)| authority.primary_to_primary)
-            .collect();
-        let bytes = bincode::serialize(&PrimaryMessage::GradeVote(vote.clone()))
-            .expect("Failed to serialize GRBC READY");
-        let handlers = self.network.broadcast(addresses, Bytes::from(bytes)).await;
-        self.cancel_handlers
-            .entry(vote.round)
-            .or_insert_with(Vec::new)
-            .extend(handlers);
-    }
-
-    #[async_recursion]
-    async fn process_grade_vote(&mut self, vote: GradeVote) -> DagResult<()> {
-        let author_stake = self.committee.stake(&vote.author);
-        let support = self
-            .ready_support
-            .entry(vote.id.clone())
-            .or_insert_with(|| (vote.round, vote.origin, HashSet::new(), 0));
-        ensure!(
-            support.0 == vote.round && support.1 == vote.origin,
-            DagError::UnexpectedGradeVote(vote.id.clone())
-        );
-        if support.2.insert(vote.author) {
-            support.3 += author_stake;
-        }
-        let support_stake = support.3;
-
-        // Bracha READY amplification: f+1 matching READY messages guarantee
-        // that at least one honest node sent READY. Relay once even when the
-        // certificate itself has not arrived yet.
-        if support_stake >= self.committee.validity_threshold()
-            && self.grade_voted.insert(vote.id.clone())
-        {
-            let relay = GradeVote::new_for(
-                vote.id.clone(),
-                vote.round,
-                vote.origin,
-                &self.name,
-                &mut self.signature_service,
-            )
-            .await;
-            self.broadcast_grade_vote(&relay).await;
-            self.process_grade_vote(relay).await?;
-        }
-
-        let certificate = match self.grbc_certificates.get(&vote.id).cloned() {
-            Some(certificate) => certificate,
-            None => {
-                let pending = self
-                    .pending_grade_votes
-                    .entry(vote.id.clone())
-                    .or_insert_with(Vec::new);
-                if !pending
-                    .iter()
-                    .any(|candidate| candidate.author == vote.author)
-                {
-                    pending.push(vote);
-                }
-                return Ok(());
-            }
-        };
-        let digest = vote.id.clone();
-        let proof = self
-            .grade_aggregators
-            .entry(digest.clone())
-            .or_insert_with(GradeVotesAggregator::new)
-            .append(vote, &self.committee, &certificate)?;
-
-        if let Some(proof) = proof {
-            trace!("Locally delivered GRBC grade 2 for {:?}", certificate);
-            self.process_graded_certificate(proof).await?;
-        }
-        Ok(())
-    }
-
-    async fn process_graded_certificate(&mut self, proof: GradedCertificate) -> DagResult<()> {
-        self.observe_header(&proof.certificate.header).await;
-        let digest = proof.certificate.digest();
         if self.grade_two.insert(digest.clone()) {
-            trace!("GRBC grade 2 delivered for {:?}", proof.certificate);
+            trace!("GRBC grade 2 delivered for {:?}", certificate);
             self.tx_consensus
-                .send(ConsensusMessage::GradeTwo(proof.certificate.clone()))
+                .send(ConsensusMessage::GradeTwo(certificate.clone()))
                 .await
                 .expect("Failed to send grade-2 certificate to consensus");
             self.weak_edge_candidates
-                .insert(digest, proof.certificate.round());
-            self.try_advance_grade_two(proof.certificate).await?;
+                .insert(digest, certificate.round());
+            self.try_advance_grade_two(certificate).await?;
         }
+        self.retry_round_advance_pending().await?;
         Ok(())
     }
 
@@ -598,7 +506,7 @@ impl Core {
         {
             let round = certificate.round();
             let virtual_edges = self
-                .grbc_certificates
+                .grade_one_certificates
                 .iter()
                 .filter(|(digest, certificate)| {
                     certificate.round() == round && !self.grade_two.contains(*digest)
@@ -651,7 +559,7 @@ impl Core {
         Ok(())
     }
 
-    fn sanitize_vote(&mut self, vote: &Vote) -> DagResult<()> {
+    fn sanitize_grade_one_vote(&mut self, vote: &GradeOneVote) -> DagResult<()> {
         ensure!(
             self.gc_round <= vote.round,
             DagError::TooOld(vote.digest(), vote.round)
@@ -671,68 +579,8 @@ impl Core {
         certificate.verify(&self.committee).map_err(DagError::from)
     }
 
-    fn verify_grade_vote(
-        committee: &Committee,
-        gc_round: Round,
-        vote: &GradeVote,
-    ) -> DagResult<()> {
-        ensure!(
-            gc_round <= vote.round,
-            DagError::TooOld(vote.id.clone(), vote.round)
-        );
-        ensure!(
-            committee.stake(&vote.origin) > 0,
-            DagError::UnknownAuthority(vote.origin)
-        );
-        vote.verify(committee)
-    }
-
-    fn sanitize_graded_certificate(&mut self, proof: &GradedCertificate) -> DagResult<()> {
-        ensure!(
-            self.gc_round <= proof.certificate.round(),
-            DagError::TooOld(proof.certificate.digest(), proof.certificate.round())
-        );
-        proof.verify(&self.committee)
-    }
-
     // Main loop listening to incoming messages.
     pub async fn run(&mut self) {
-        // READY signature verification is CPU work and may complete out of
-        // arrival order. Only verified results re-enter this single state
-        // machine, keeping support aggregation deterministic and race-free.
-        let (tx_verified_ready, mut rx_verified_ready) =
-            tokio::sync::mpsc::unbounded_channel::<(GradeVote, DagResult<()>)>();
-        type ReadyJob = (Round, GradeVote);
-        let worker_count = std::thread::available_parallelism()
-            .map(|count| count.get())
-            .unwrap_or(2)
-            .min(4)
-            .max(1);
-        // Keep the CPU concurrency fixed while allowing Core to accept READY
-        // bursts without blocking the GRBC state machine.
-        let (tx_ready_jobs, rx_ready_jobs) = work_channel::<ReadyJob>();
-        let rx_ready_jobs = Arc::new(Mutex::new(rx_ready_jobs));
-        let verification_committee = Arc::new(self.committee.clone());
-        for _ in 0..worker_count {
-            let jobs = rx_ready_jobs.clone();
-            let results = tx_verified_ready.clone();
-            let committee = verification_committee.clone();
-            std::thread::spawn(move || loop {
-                let job = jobs.lock().expect("READY verifier queue poisoned").recv();
-                let (gc_round, vote) = match job {
-                    Ok(job) => job,
-                    Err(_) => break,
-                };
-                let result = Self::verify_grade_vote(&committee, gc_round, &vote);
-                if results.send((vote, result)).is_err() {
-                    break;
-                }
-            });
-        }
-        let submit_ready = |vote: GradeVote, gc_round: Round, jobs: &WorkSender<ReadyJob>| {
-            jobs.send((gc_round, vote))
-                .expect("READY verifier pool stopped");
-        };
         loop {
             let result = tokio::select! {
                 // We receive here messages from other primaries.
@@ -745,27 +593,15 @@ impl Core {
                             }
 
                         },
-                        PrimaryMessage::Vote(vote) => {
-                            match self.sanitize_vote(&vote) {
-                                Ok(()) => self.process_vote(vote).await,
+                        PrimaryMessage::GradeOneVote(vote) => {
+                            match self.sanitize_grade_one_vote(&vote) {
+                                Ok(()) => self.process_grade_one_vote(vote).await,
                                 error => error
                             }
                         },
                         PrimaryMessage::Certificate(certificate) => {
                             match self.sanitize_certificate(&certificate) {
                                 Ok(()) =>  self.process_certificate(certificate).await,
-                                error => error
-                            }
-                        },
-                        PrimaryMessage::GradeVote(vote) => {
-                            submit_ready(vote, self.gc_round, &tx_ready_jobs);
-                            Ok(())
-                        },
-                        PrimaryMessage::GradedCertificate(proof) => {
-                            match self.sanitize_graded_certificate(&proof) {
-                                Ok(()) => {
-                                    self.process_graded_certificate(proof).await
-                                },
                                 error => error
                             }
                         },
@@ -790,12 +626,6 @@ impl Core {
 
                 Some(command) = self.rx_consensus.recv() => {
                     self.process_consensus_command(command).await
-                },
-                Some((vote, verification)) = rx_verified_ready.recv() => {
-                    match verification {
-                        Ok(()) => self.process_grade_vote(vote).await,
-                        Err(error) => Err(error),
-                    }
                 },
             };
             match result {
@@ -825,15 +655,11 @@ impl Core {
                 self.pending_votes
                     .retain(|_, votes| votes.iter().any(|vote| vote.round >= gc_round));
                 self.certificates_aggregators.retain(|k, _| k >= &gc_round);
+                self.grade_one_certificates
+                    .retain(|_, certificate| certificate.round() >= gc_round);
                 self.grbc_certificates.retain(|_, x| x.round() >= gc_round);
                 self.observed_headers.retain(|_, x| x.round >= gc_round);
                 let live: HashSet<_> = self.grbc_certificates.keys().cloned().collect();
-                self.grade_aggregators.retain(|k, _| live.contains(k));
-                self.pending_grade_votes
-                    .retain(|_, votes| votes.iter().any(|vote| vote.round >= gc_round));
-                self.ready_support
-                    .retain(|_, (round, _, _, _)| *round >= gc_round);
-                self.grade_voted.retain(|k| live.contains(k));
                 self.grade_two.retain(|k| live.contains(k));
                 self.weak_edge_candidates
                     .retain(|_, round| *round >= gc_round);

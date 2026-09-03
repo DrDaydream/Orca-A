@@ -158,6 +158,41 @@ async fn higher_round_jump_checks_each_crossed_round_once() {
     assert_eq!(state.highest_advanced_round, 8);
 }
 
+#[tokio::test]
+async fn missing_leader_request_retries_once_after_300_ms() {
+    let committee = mock_committee();
+    let (tx_primary, mut rx_primary) = channel(10);
+    let mut consensus = Consensus {
+        committee: committee.clone(),
+        gc_depth: 50,
+        rx_primary: channel(1).1,
+        tx_primary,
+        tx_output: OutputSender::Individual(channel(10).0),
+        genesis: Certificate::genesis(&committee),
+    };
+    let mut state = State::new(Certificate::genesis(&committee));
+
+    consensus.request_missing_leader(2, &mut state).await;
+    assert!(matches!(
+        rx_primary.recv().await,
+        Some(ConsensusCommand::LeaderRequest(2, _))
+    ));
+
+    consensus.retry_missing_leaders(&mut state).await;
+    assert!(rx_primary.try_recv().is_err());
+
+    tokio::time::sleep(LEADER_RETRY_DELAY + Duration::from_millis(20)).await;
+    consensus.retry_missing_leaders(&mut state).await;
+    assert!(matches!(
+        rx_primary.recv().await,
+        Some(ConsensusCommand::LeaderRequest(2, _))
+    ));
+
+    consensus.retry_missing_leaders(&mut state).await;
+    assert!(rx_primary.try_recv().is_err());
+    assert!(!state.missing_leader_requests.contains_key(&2));
+}
+
 #[test]
 fn grade_two_waits_for_strong_and_weak_edges() {
     let committee = mock_committee();
@@ -241,7 +276,7 @@ fn finds_paths_over_strong_and_weak_edges() {
 }
 
 #[test]
-fn order_dag_includes_weak_parent_history() {
+fn order_dag_includes_weak_and_virtual_history() {
     let committee = mock_committee();
     let consensus = Consensus {
         committee: committee.clone(),
@@ -255,15 +290,19 @@ fn order_dag_includes_weak_parent_history() {
     let authorities: Vec<_> = keys().into_iter().map(|(key, _)| key).collect();
 
     let (weak_digest, weak_parent) = mock_certificate(authorities[1], 1, BTreeSet::new());
+    let (virtual_digest, virtual_parent) = mock_certificate(authorities[2], 2, BTreeSet::new());
     let (_, mut leader) = mock_certificate(authorities[0], 3, BTreeSet::new());
     leader.header.weak_edges.insert(weak_digest.clone());
+    leader.header.virtual_edges.insert(virtual_digest.clone());
     leader.header.id = leader.header.digest();
 
     state.promote_to_dag(weak_parent.clone());
+    state.promote_to_dag(virtual_parent.clone());
     state.promote_to_dag(leader.clone());
     let ordered = consensus.order_dag(&leader, &state);
 
     assert!(ordered.iter().any(|block| block.digest() == weak_digest));
+    assert!(ordered.iter().any(|block| block.digest() == virtual_digest));
     assert_eq!(ordered.last().unwrap().digest(), leader.digest());
 }
 
@@ -1048,9 +1087,15 @@ async fn missing_leader() {
         }
     });
 
-    let command = tokio::time::timeout(std::time::Duration::from_secs(1), rx_primary.recv())
-        .await
-        .expect("rule 3 did not request the missing leader")
-        .expect("consensus command channel closed");
-    assert!(!matches!(command, ConsensusCommand::LeaderRequest(..)));
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            match rx_primary.recv().await {
+                Some(ConsensusCommand::LeaderRequest(..)) => break,
+                Some(_) => continue,
+                None => panic!("consensus command channel closed"),
+            }
+        }
+    })
+    .await
+    .expect("rule 3 did not request the missing leader");
 }
