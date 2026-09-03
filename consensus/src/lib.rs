@@ -971,6 +971,7 @@ impl Consensus {
             return;
         }
         if state.committed_leaders.contains(&leader_round)
+            || state.skipped_leaders.contains(&leader_round)
             || state.pending_leaders.contains_key(&leader_round)
         {
             return;
@@ -1011,6 +1012,7 @@ impl Consensus {
             return;
         }
         if state.committed_leaders.contains(&leader_round)
+            || state.skipped_leaders.contains(&leader_round)
             || state.pending_leaders.contains_key(&leader_round)
         {
             return;
@@ -1320,6 +1322,27 @@ impl Consensus {
         double_segment_first.len() as Stake >= threshold || suffix_first.len() as Stake >= threshold
     }
 
+    fn bridged_predecessor(
+        &self,
+        higher: &Certificate,
+        missing_round: Round,
+        state: &State,
+    ) -> Option<(Round, Certificate)> {
+        let mut candidate_round = missing_round.checked_sub(3)?;
+        loop {
+            if let Some(candidate) = self.observed_leader(candidate_round, state) {
+                if self.missing_leader_bridge(higher, &candidate.digest(), state) {
+                    return Some((candidate_round, candidate));
+                }
+            }
+
+            if candidate_round < 4 {
+                return None;
+            }
+            candidate_round -= 3;
+        }
+    }
+
     /// Commit rule 3 resolves leaders that did not satisfy rules 1 or 2.
     /// A commit-ready leader at round h observes leaders h-3, h-6, ... .
     /// Every adjacent pair in that chain must have either a strong path or
@@ -1343,17 +1366,53 @@ impl Consensus {
                     && !state.skipped_leaders.contains(&target_round)
                     && !state.pending_leaders.contains_key(&target_round)
                 {
-                    let target = self.observed_leader(target_round, state);
-                    if target.is_none() {
-                        sampled_debug!(
-                            target_round,
-                            "Requesting absent leader round {} during rule-3 backtracking",
-                            target_round
-                        );
-                        self.request_missing_leader(target_round, state).await;
-                        break;
-                    }
                     let observer = self.observed_leader(observer_round, state);
+                    let mut target = self.observed_leader(target_round, state);
+                    if target.is_none() {
+                        let bridge = observer.as_ref().and_then(|higher| {
+                            self.bridged_predecessor(higher, target_round, state)
+                        });
+                        if let Some((bridged_round, bridged_target)) = bridge {
+                            let bridged_target_resolved =
+                                state.committed_leaders.contains(&bridged_round)
+                                    || state.skipped_leaders.contains(&bridged_round)
+                                    || state.pending_leaders.contains_key(&bridged_round);
+                            let mut skipped_round = target_round;
+                            while skipped_round > bridged_round {
+                                if !state.committed_leaders.contains(&skipped_round)
+                                    && !state.pending_leaders.contains_key(&skipped_round)
+                                {
+                                    sampled_debug!(
+                                        skipped_round,
+                                        "Skipping absent leader round {} after bridge from round {} to round {}",
+                                        skipped_round,
+                                        observer_round,
+                                        bridged_round
+                                    );
+                                    self.mark_rule_three_skipped(skipped_round, state);
+                                }
+                                skipped_round -= 3;
+                            }
+                            target_round = bridged_round;
+                            if bridged_target_resolved {
+                                self.drain_ready_leaders(state).await;
+                                if target_round < 4 {
+                                    break;
+                                }
+                                target_round -= 3;
+                                continue;
+                            }
+                            target = Some(bridged_target);
+                        } else {
+                            sampled_debug!(
+                                target_round,
+                                "Requesting absent leader round {} after rule-3 bridge search failed",
+                                target_round
+                            );
+                            self.request_missing_leader(target_round, state).await;
+                            break;
+                        }
+                    }
                     let target_digest = target.as_ref().unwrap().digest();
                     if observer.as_ref().map_or(true, |observer| {
                         !self.history_references_strong_or_virtual(observer, &target_digest, state)
@@ -1372,6 +1431,7 @@ impl Consensus {
                     }
                     let mut chain_round = observer_round;
                     let mut chain_valid = true;
+                    let mut waiting_for_recovery = false;
 
                     while chain_valid && chain_round > target_round {
                         let lower_round = chain_round - 3;
@@ -1382,6 +1442,7 @@ impl Consensus {
                             self.observed_leader(lower_round, state)
                         };
                         let mut jump_to_target = false;
+                        let mut bridged_chain_round = None;
                         chain_valid = match (higher, lower) {
                             (Some(higher), Some(lower)) => {
                                 let lower_digest = lower.digest();
@@ -1393,47 +1454,67 @@ impl Consensus {
                                     ) >= self.committee.validity_threshold()
                             }
                             (Some(higher), None) => {
-                                sampled_debug!(
-                                    lower_round,
-                                    "Skipping absent leader round {} in rule-3 chain",
-                                    lower_round
-                                );
-                                self.mark_rule_three_skipped(lower_round, state);
-                                let target_digest = target.as_ref().unwrap().digest();
-                                if self.missing_leader_bridge(&higher, &target_digest, state) {
-                                    sampled_debug!(lower_round,
-                                        "Rule 3 bridges absent leader round {} from leader round {} history",
-                                        lower_round, chain_round
-                                    );
-                                    jump_to_target = true;
+                                if state.skipped_leaders.contains(&lower_round) {
+                                    let target_digest = target.as_ref().unwrap().digest();
+                                    if self.missing_leader_bridge(&higher, &target_digest, state) {
+                                        jump_to_target = true;
+                                        true
+                                    } else {
+                                        waiting_for_recovery = true;
+                                        self.request_missing_leader(target_round, state).await;
+                                        false
+                                    }
+                                } else if let Some((bridged_round, _)) =
+                                    self.bridged_predecessor(&higher, lower_round, state)
+                                {
+                                    let mut skipped_round = lower_round;
+                                    while skipped_round > bridged_round {
+                                        sampled_debug!(
+                                            skipped_round,
+                                            "Skipping absent leader round {} after bridge from round {} to round {}",
+                                            skipped_round,
+                                            chain_round,
+                                            bridged_round
+                                        );
+                                        self.mark_rule_three_skipped(skipped_round, state);
+                                        skipped_round -= 3;
+                                    }
+                                    jump_to_target = bridged_round == target_round;
+                                    bridged_chain_round = Some(bridged_round);
                                     true
                                 } else {
+                                    waiting_for_recovery = true;
+                                    sampled_debug!(
+                                        lower_round,
+                                        "Requesting absent leader round {} after rule-3 chain bridge failed",
+                                        lower_round
+                                    );
+                                    self.request_missing_leader(lower_round, state).await;
                                     false
                                 }
                             }
-                            (None, lower) => {
+                            (None, _) => {
+                                waiting_for_recovery = true;
                                 sampled_debug!(
                                     chain_round,
-                                    "Skipping absent leader round {} in rule-3 chain",
+                                    "Requesting absent leader round {} after rule-3 chain bridge failed",
                                     chain_round
                                 );
-                                self.mark_rule_three_skipped(chain_round, state);
-                                if lower.is_none() {
-                                    sampled_debug!(
-                                        lower_round,
-                                        "Skipping absent leader round {} in rule-3 chain",
-                                        lower_round
-                                    );
-                                    self.mark_rule_three_skipped(lower_round, state);
-                                }
+                                self.request_missing_leader(chain_round, state).await;
                                 false
                             }
                         };
                         chain_round = if jump_to_target {
                             target_round
+                        } else if let Some(bridged_round) = bridged_chain_round {
+                            bridged_round
                         } else {
                             lower_round
                         };
+                    }
+
+                    if waiting_for_recovery {
+                        break;
                     }
 
                     if chain_valid {
@@ -1624,7 +1705,7 @@ impl Consensus {
     /// Queue a leader once and commit ready leaders in consecutive round order.
     async fn queue_leader_commit(&mut self, leader: Certificate, rule: u8, state: &mut State) {
         let round = leader.round();
-        if state.committed_leaders.contains(&round) {
+        if state.committed_leaders.contains(&round) || state.skipped_leaders.contains(&round) {
             return;
         }
         // Entering pending authorizes early, verified GRBC data for the leader

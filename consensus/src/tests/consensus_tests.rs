@@ -659,7 +659,7 @@ fn commit_rule_three_paths_are_distinct_when_first_intermediate_differs() {
 }
 
 #[tokio::test]
-async fn rule_three_skips_a_leader_without_any_observed_digest() {
+async fn rule_three_requests_a_leader_without_any_observed_certificate() {
     let committee = mock_committee();
     let (tx_primary, mut rx_primary) = channel(10);
     let (tx_output, _rx_output) = channel(10);
@@ -693,8 +693,11 @@ async fn rule_three_skips_a_leader_without_any_observed_digest() {
     state.pending_leaders.insert(4, higher);
 
     consensus.evaluate_commit_rule_three(&mut state).await;
-    assert!(state.skipped_leaders.contains(&1));
-    assert!(rx_primary.try_recv().is_err());
+    assert!(!state.skipped_leaders.contains(&1));
+    assert!(matches!(
+        rx_primary.try_recv(),
+        Ok(ConsensusCommand::LeaderRequest(1, authority)) if authority == leader_authority
+    ));
     assert!(!state.dag_digests.contains(&leader_digest));
     assert!(!state.dag_digests.contains(&dependency_digest));
 }
@@ -786,6 +789,61 @@ async fn rule_three_bridges_missing_leader_with_f_plus_one_history_blocks() {
 
     assert!(state.skipped_leaders.contains(&4));
     assert!(state.committed_leaders.contains(&1));
+}
+
+#[tokio::test]
+async fn rule_three_bridges_two_consecutive_missing_leaders() {
+    let committee = mock_committee();
+    let (tx_primary, mut rx_primary) = channel(20);
+    let (tx_output, _rx_output) = channel(20);
+    let mut consensus = Consensus {
+        committee: committee.clone(),
+        gc_depth: 50,
+        rx_primary: channel(1).1,
+        tx_primary,
+        tx_output: OutputSender::Individual(tx_output),
+        genesis: Certificate::genesis(&committee),
+    };
+    let mut state = State::new(Certificate::genesis(&committee));
+    let mut authorities: Vec<_> = keys().into_iter().map(|(key, _)| key).collect();
+    authorities.sort();
+
+    let (target_digest, target) =
+        mock_certificate(consensus.ordering_leader_authority(1), 1, BTreeSet::new());
+    state.observe(target);
+
+    let mut parent = target_digest;
+    for round in 2..10 {
+        let authority = if round == 4 || round == 7 {
+            authorities
+                .iter()
+                .copied()
+                .find(|authority| *authority != consensus.ordering_leader_authority(round))
+                .unwrap()
+        } else {
+            authorities[(round as usize) % authorities.len()]
+        };
+        let (digest, block) =
+            mock_certificate(authority, round, [parent].iter().cloned().collect());
+        state.observe(block);
+        parent = digest;
+    }
+
+    let (_, observer) = mock_certificate(
+        consensus.ordering_leader_authority(10),
+        10,
+        [parent].iter().cloned().collect(),
+    );
+    state.observe(observer.clone());
+    state.promote_to_dag(observer.clone());
+    state.pending_leaders.insert(10, observer);
+
+    consensus.evaluate_commit_rule_three(&mut state).await;
+
+    assert!(state.skipped_leaders.contains(&7));
+    assert!(state.skipped_leaders.contains(&4));
+    assert!(state.committed_leaders.contains(&1));
+    assert!(rx_primary.try_recv().is_err());
 }
 
 #[tokio::test]
