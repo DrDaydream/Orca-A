@@ -44,12 +44,13 @@ class LogParser:
                 results = p.map(self._parse_primaries, primaries)
         except (ValueError, IndexError, AttributeError) as e:
             raise ParseError(f'Failed to parse nodes\' logs: {e}')
-        proposals, commits, header_proposals, header_commits, leader_ready, commit_rules, self.configs, primary_ips = zip(*results)
+        proposals, commits, header_proposals, header_commits, leader_ready, rule_orders, commit_rules, self.configs, primary_ips = zip(*results)
         self.proposals = self._merge_results([x.items() for x in proposals])
         self.commits = self._merge_results([x.items() for x in commits])
         self.header_proposals = self._merge_results([x.items() for x in header_proposals])
         self.header_commits = self._merge_tagged_results(header_commits)
         self.leader_ready = self._merge_results([x.items() for x in leader_ready])
+        self.rule_orders = self._merge_results([x.items() for x in rule_orders])
         self.commit_rules = self._merge_commit_rules(commit_rules)
 
         # Parse the workers logs.
@@ -93,7 +94,13 @@ class LogParser:
         merged = {}
         for values in inputs:
             for leader, value in values.items():
-                merged.setdefault(leader, value)
+                previous = merged.get(leader)
+                if previous is None:
+                    merged[leader] = value
+                elif previous[1] == 'skip' and value[1] == 'commit':
+                    merged[leader] = value
+                elif previous[1] == value[1] == 'commit' and value[0] < previous[0]:
+                    merged[leader] = value
         return merged
 
     def _parse_clients(self, log):
@@ -137,10 +144,56 @@ class LogParser:
         header_proposals = self._merge_results([[(d, self._to_posix(t)) for t, d in tmp]])
         tmp = findall(r'\[(.*Z) .* Header committed round \d+ digest (\S+) leader (true|false)', log)
         header_commits = {d: (self._to_posix(t), leader == 'true') for t, d, leader in tmp}
-        tmp = findall(r'Leader commit-ready round \d+ digest (\S+) at (\d+)', log)
-        leader_ready = {d: int(t) / 1_000 for d, t in tmp}
-        tmp = findall(r'Commit rule stats leader (\S+) rule ([123]) outcome (commit|skip) blocks (\d+)', log)
-        commit_rules = {leader: (int(rule), outcome, int(blocks)) for leader, rule, outcome, blocks in tmp}
+        outcomes = findall(
+            r'Leader outcome round (\d+) digest (\S+) rule ([123]) '
+            r'outcome (commit|skip) blocks (\d+) ready_at (\d+) '
+            r'commit_at (\d+) headers (\S+)',
+            log,
+        )
+        if outcomes:
+            leader_ready = {
+                digest: int(ready_at) / 1_000
+                for _, digest, _, outcome, _, ready_at, _, _ in outcomes
+                if outcome == 'commit' and digest != '-' and int(ready_at) > 0
+            }
+            ordered = []
+            committed_headers = {}
+            for _, _, _, outcome, _, _, commit_at, headers in outcomes:
+                if outcome != 'commit' or headers == '-':
+                    continue
+                for item in headers.split(','):
+                    digest, ordered_at, is_leader = item.rsplit('@', 2)
+                    committed = int(commit_at) / 1_000
+                    previous = committed_headers.get(digest)
+                    value = (committed, is_leader == '1')
+                    if previous is None or committed < previous[0]:
+                        committed_headers[digest] = value
+                    if is_leader == '0':
+                        ordered.append((digest, int(ordered_at) / 1_000))
+            header_commits = committed_headers
+            rule_orders = self._merge_results([ordered])
+            commit_rules = {
+                int(round): (int(rule), outcome, int(blocks))
+                for round, _, rule, outcome, blocks, _, _, _ in outcomes
+            }
+        else:
+            # Preserve compatibility with logs generated before leader
+            # summaries combined rule outcomes and ordering samples.
+            tmp = findall(r'Leader commit-ready round \d+ digest (\S+) at (\d+)', log)
+            leader_ready = {d: int(t) / 1_000 for d, t in tmp}
+            tmp = findall(r'\[(.*Z) .* Header rule-ordered round \d+ digest (\S+)', log)
+            rule_orders = self._merge_results(
+                [[(d, self._to_posix(t)) for t, d in tmp]]
+            )
+            tmp = findall(
+                r'Commit rule stats leader (\S+) rule ([123]) '
+                r'outcome (commit|skip) blocks (\d+)',
+                log,
+            )
+            commit_rules = {
+                leader: (int(rule), outcome, int(blocks))
+                for leader, rule, outcome, blocks in tmp
+            }
 
         configs = {
             'header_size': int(
@@ -168,7 +221,7 @@ class LogParser:
 
         ip = search(r'booted on (\d+.\d+.\d+.\d+)', log).group(1)
         
-        return proposals, commits, header_proposals, header_commits, leader_ready, commit_rules, configs, ip
+        return proposals, commits, header_proposals, header_commits, leader_ready, rule_orders, commit_rules, configs, ip
 
     def _parse_workers(self, log):
         if search(r'(?:panic|Error)', log) is not None:
@@ -239,19 +292,25 @@ class LogParser:
             for digest, ready in self.leader_ready.items()
             if digest in self.header_proposals
         ]
+        rule_order = [
+            ordered - self.header_proposals[digest]
+            for digest, ordered in self.rule_orders.items()
+            if digest in self.header_proposals
+        ]
         leader_times.sort()
         intervals = [b - a for a, b in zip(leader_times, leader_times[1:])]
         avg = lambda values: mean(values) if values else 0
-        return avg(leaders), avg(non_leaders), avg(all_headers), avg(intervals)
+        return avg(leaders), avg(non_leaders), avg(all_headers), avg(intervals), avg(rule_order)
 
     def _commit_rule_ratios(self):
         leader_total = len(self.commit_rules)
         block_total = sum(value[2] for value in self.commit_rules.values())
-        categories = ((1, 'commit'), (2, 'commit'), (3, 'commit'), (3, 'skip'))
+        categories = ((1, None), (2, None), (3, 'commit'), (3, 'skip'))
         leader_ratios, block_ratios = [], []
         for rule, outcome in categories:
-            leaders = sum(value[:2] == (rule, outcome) for value in self.commit_rules.values())
-            blocks = sum(value[2] for value in self.commit_rules.values() if value[:2] == (rule, outcome))
+            matches = lambda value: value[0] == rule and (outcome is None or value[1] == outcome)
+            leaders = sum(matches(value) for value in self.commit_rules.values())
+            blocks = sum(value[2] for value in self.commit_rules.values() if matches(value))
             leader_ratios.append(100 * leaders / leader_total if leader_total else 0)
             block_ratios.append(100 * blocks / block_total if block_total else 0)
         return leader_ratios, block_ratios
@@ -269,7 +328,7 @@ class LogParser:
         consensus_tps, consensus_bps, _ = self._consensus_throughput()
         end_to_end_tps, end_to_end_bps, duration = self._end_to_end_throughput()
         end_to_end_latency = self._end_to_end_latency() * 1_000
-        leader_latency, non_leader_latency, all_header_latency, leader_interval = (x * 1_000 for x in self._header_latency_stats())
+        leader_latency, non_leader_latency, all_header_latency, leader_interval, rule_order_latency = (x * 1_000 for x in self._header_latency_stats())
         rule_leaders, rule_blocks = self._commit_rule_ratios()
 
         return (
@@ -302,6 +361,7 @@ class LogParser:
             f' Non-leader commit latency: {round(non_leader_latency):,} ms\n'
             f' All committed headers latency: {round(all_header_latency):,} ms\n'
             f' Leader commit interval: {round(leader_interval):,} ms\n'
+            f' Non-leader rule-order latency: {round(rule_order_latency):,} ms\n'
             f' Rule 1 leader ratio: {rule_leaders[0]:.2f}%\n'
             f' Rule 2 leader ratio: {rule_leaders[1]:.2f}%\n'
             f' Rule 3 commit leader ratio: {rule_leaders[2]:.2f}%\n'
