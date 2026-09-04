@@ -62,6 +62,8 @@ pub struct Core {
     votes_aggregators: HashMap<Digest, GradeOneVotesAggregator>,
     /// Valid votes that arrived before their header.
     pending_votes: HashMap<Digest, Vec<GradeOneVote>>,
+    /// Locally created GRBC votes waiting to be sent in one network envelope.
+    vote_outbox: Vec<GradeOneVote>,
     /// Aggregates certificates to use as parents for new headers.
     certificates_aggregators: HashMap<Round, Box<CertificatesAggregator>>,
     /// One-vote certificates delivered locally at GRBC grade 1.
@@ -122,6 +124,7 @@ impl Core {
                 processing: HashMap::with_capacity(2 * gc_depth as usize),
                 votes_aggregators: HashMap::new(),
                 pending_votes: HashMap::new(),
+                vote_outbox: Vec::new(),
                 certificates_aggregators: HashMap::with_capacity(2 * gc_depth as usize),
                 grade_one_certificates: HashMap::new(),
                 grbc_certificates: HashMap::new(),
@@ -307,23 +310,11 @@ impl Core {
             .or_insert_with(HashSet::new)
             .insert(header.author)
         {
-            // Ordinary VOTE is an all-to-all GRBC message. Every node can
-            // therefore collect a quorum and form the certificate locally.
+            // Ordinary GRBC votes are all-to-all, allowing every node to form
+            // the same certificate; batching amortizes their network envelopes.
             let vote = GradeOneVote::new(header, &self.name, &mut self.signature_service).await;
             debug!("Created {:?}", vote);
-            let addresses = self
-                .committee
-                .others_primaries(&self.name)
-                .iter()
-                .map(|(_, authority)| authority.primary_to_primary)
-                .collect();
-            let bytes = bincode::serialize(&PrimaryMessage::GradeOneVote(vote.clone()))
-                .expect("Failed to serialize GRBC vote");
-            let handlers = self.network.broadcast(addresses, Bytes::from(bytes)).await;
-            self.cancel_handlers
-                .entry(header.round)
-                .or_insert_with(Vec::new)
-                .extend(handlers);
+            self.vote_outbox.push(vote.clone());
             self.process_grade_one_vote(vote).await?;
         }
         // A HeaderWaiter loopback also signals that optional weak references
@@ -391,6 +382,35 @@ impl Core {
                 .expect("Failed to process valid certificate");
         }
         Ok(())
+    }
+
+    async fn flush_grbc_outboxes(&mut self) {
+        if !self.vote_outbox.is_empty() {
+            let round = self
+                .vote_outbox
+                .iter()
+                .map(|vote| vote.round)
+                .max()
+                .unwrap_or_default();
+            let votes = std::mem::take(&mut self.vote_outbox);
+            self.broadcast_grbc_batch(PrimaryMessage::GradeOneVoteBatch(votes), round)
+                .await;
+        }
+    }
+
+    async fn broadcast_grbc_batch(&mut self, message: PrimaryMessage, round: Round) {
+        let addresses = self
+            .committee
+            .others_primaries(&self.name)
+            .iter()
+            .map(|(_, authority)| authority.primary_to_primary)
+            .collect();
+        let bytes = bincode::serialize(&message).expect("Failed to serialize GRBC batch");
+        let handlers = self.network.broadcast(addresses, Bytes::from(bytes)).await;
+        self.cancel_handlers
+            .entry(round)
+            .or_default()
+            .extend(handlers);
     }
 
     async fn deliver_grade_one(
@@ -626,6 +646,13 @@ impl Core {
                 self.sanitize_grade_one_vote(&vote)?;
                 self.process_grade_one_vote(vote).await
             }
+            PrimaryMessage::GradeOneVoteBatch(votes) => {
+                for vote in votes {
+                    self.sanitize_grade_one_vote(&vote)?;
+                    self.process_grade_one_vote(vote).await?;
+                }
+                Ok(())
+            }
             PrimaryMessage::Certificate(certificate) => {
                 self.sanitize_certificate(&certificate)?;
                 self.process_certificate(certificate).await
@@ -683,6 +710,8 @@ impl Core {
                 Err(e @ DagError::TooOld(..)) => debug!("{}", e),
                 Err(e) => warn!("{}", e),
             }
+            self.flush_grbc_outboxes().await;
+
             // Cleanup internal state.
             let round = self.consensus_round.load(Ordering::Relaxed);
             if round > self.gc_depth {
