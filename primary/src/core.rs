@@ -361,22 +361,8 @@ impl Core {
         {
             debug!("Assembled {:?}", certificate);
 
-            // Broadcast the certificate so nodes missing individual votes can
-            // still complete Grade-2 delivery.
-            let addresses = self
-                .committee
-                .others_primaries(&self.name)
-                .iter()
-                .map(|(_, authority)| authority.primary_to_primary)
-                .collect();
-            let bytes = bincode::serialize(&PrimaryMessage::Certificate(certificate.clone()))
-                .expect("Failed to serialize our own certificate");
-            let handlers = self.network.broadcast(addresses, Bytes::from(bytes)).await;
-            self.cancel_handlers
-                .entry(certificate.round())
-                .or_insert_with(Vec::new)
-                .extend(handlers);
-
+            // Every primary receives the all-to-all vote batches and assembles
+            // the quorum certificate locally; no certificate relay is needed.
             self.process_certificate(certificate)
                 .await
                 .expect("Failed to process valid certificate");
