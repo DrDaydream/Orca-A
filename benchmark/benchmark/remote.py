@@ -1,5 +1,6 @@
 # Copyright(C) Facebook, Inc. and its affiliates.
-from collections import OrderedDict
+from collections import OrderedDict, deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from fabric import Connection, ThreadingGroup as Group
 from fabric.exceptions import GroupException
 from paramiko import RSAKey
@@ -8,7 +9,10 @@ from os.path import basename, splitext
 from time import sleep
 from math import ceil
 from copy import deepcopy
+from threading import Event, Lock, Thread
+import shlex
 import subprocess
+import sys
 
 from benchmark.config import Committee, Key, NodeParameters, BenchParameters, ConfigError
 from benchmark.utils import BenchError, Print, PathMaker, progress_bar
@@ -29,6 +33,49 @@ class FabricError(Exception):
 
 class ExecutionError(Exception):
     pass
+
+
+_INSTALL_OUTPUT_LOCK = Lock()
+
+
+class _InstallOutput:
+    ''' Prefix streamed remote output so concurrent hosts remain identifiable. '''
+
+    def __init__(self, host, step, stream, output_tail, stream_name):
+        self.host = host
+        self.step = step
+        self.stream = stream
+        self.output_tail = output_tail
+        self.stream_name = stream_name
+        self.buffer = ''
+
+    def _write_line(self, line):
+        with _INSTALL_OUTPUT_LOCK:
+            if line:
+                self.output_tail.append(f'{self.stream_name}: {line}')
+            self.stream.write(
+                f'[INSTALL][{self.host}][{self.step}][output] {line}\n'
+            )
+            self.stream.flush()
+
+    def write(self, data):
+        if not data:
+            return 0
+        self.buffer += data
+        while '\n' in self.buffer:
+            line, self.buffer = self.buffer.split('\n', 1)
+            self._write_line(line.rstrip('\r'))
+        return len(data)
+
+    def flush(self):
+        with _INSTALL_OUTPUT_LOCK:
+            self.stream.flush()
+
+    def finish(self):
+        if self.buffer:
+            self._write_line(self.buffer.rstrip('\r'))
+            self.buffer = ''
+        self.flush()
 
 
 class Bench:
@@ -52,48 +99,310 @@ class Bench:
             if output.stderr:
                 raise ExecutionError(output.stderr)
 
-    def install(self):
-        Print.info('Installing rust and cloning the repo...')
-        cmd = [
-            'sudo apt-get update',
-            'sudo apt-get -y upgrade',
-            'sudo apt-get -y autoremove',
+    @staticmethod
+    def _install_status(host, step, status, detail=''):
+        detail = f' {detail}' if detail else ''
+        with _INSTALL_OUTPUT_LOCK:
+            print(
+                f'[INSTALL][{host}][{step}] {status}{detail}',
+                flush=True
+            )
 
-            # The following dependencies prevent the error: [error: linker `cc` not found].
-            'sudo apt-get -y install build-essential',
-            'sudo apt-get -y install cmake',
+    def _install_steps(self):
+        apt = (
+            'sudo -n timeout --signal=TERM --kill-after=30s 30m '
+            'env DEBIAN_FRONTEND=noninteractive '
+            'NEEDRESTART_MODE=a APT_LISTCHANGES_FRONTEND=none '
+            'apt-get -o DPkg::Lock::Timeout=900 '
+            '-o Acquire::Retries=5 '
+            '-o Acquire::ForceIPv4=true '
+            '-o Acquire::http::Timeout=30 '
+            '-o Acquire::https::Timeout=30 '
+            '-o Dpkg::Use-Pty=0 '
+        )
+        repo_url = shlex.quote(self.settings.repo_url)
+        repo_name = shlex.quote(self.settings.repo_name)
+        repo_branch = shlex.quote(self.settings.branch)
 
-            # Install rust (non-interactive).
-            'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y',
-            'source $HOME/.cargo/env',
-            'rustup default stable',
-
-            # RocksDB/bindgen require libclang. Pin the remote testbed to
-            # Clang/LLVM 14 so all protocol comparisons use the same toolchain.
-            'sudo apt-get -y install software-properties-common',
-            'sudo add-apt-repository -y universe || true',
-            'sudo apt-get update',
-            'sudo apt-get install -y clang-14 llvm-14 llvm-14-dev libclang-14-dev',
-            'sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-14 140',
-            'sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-14 140',
-            'sudo update-alternatives --set clang /usr/bin/clang-14',
-            'sudo update-alternatives --set clang++ /usr/bin/clang++-14',
-            # _update() explicitly sources ~/.cargo/env before cargo build.
-            # Persist the variables there so non-interactive Fabric shells use
-            # the pinned compiler and bindgen can locate libclang 14.
-            'grep -q "LIBCLANG_PATH=/usr/lib/llvm-14/lib" "$HOME/.cargo/env" || printf "\\nexport PATH=/usr/lib/llvm-14/bin:\\$PATH\\nexport CC=/usr/bin/clang-14\\nexport CXX=/usr/bin/clang++-14\\nexport CLANG_PATH=/usr/bin/clang-14\\nexport LIBCLANG_PATH=/usr/lib/llvm-14/lib\\nexport CXXFLAGS=\\\"-include cstdint\\\"\\n" >> "$HOME/.cargo/env"',
-
-            # Clone the repo.
-            f'(git clone {self.settings.repo_url} || (cd {self.settings.repo_name} ; git pull))'
+        return [
+            (
+                'cloud-init',
+                'if command -v cloud-init >/dev/null 2>&1; then '
+                'sudo -n timeout --signal=TERM --kill-after=30s 15m '
+                'cloud-init status --wait & cloud_pid=$!; elapsed=0; '
+                'while kill -0 "$cloud_pid" 2>/dev/null; do '
+                'echo "cloud-init still running; waited ${elapsed}s"; '
+                'sleep 10; elapsed=$((elapsed + 10)); done; '
+                'wait "$cloud_pid"; '
+                'else echo "cloud-init is not installed; skipping"; fi'
+            ),
+            (
+                'apt-lock',
+                'locks="/var/lib/dpkg/lock-frontend /var/lib/dpkg/lock '
+                '/var/cache/apt/archives/lock /var/lib/apt/lists/lock"; '
+                'elapsed=0; '
+                'while sudo -n fuser $locks >/dev/null 2>&1; do '
+                'if [ "$elapsed" -ge 900 ]; then '
+                'echo "timed out waiting for apt/dpkg locks" >&2; '
+                'sudo -n fuser -v $locks >&2; exit 1; fi; '
+                'echo "apt/dpkg lock busy; waited ${elapsed}s"; '
+                'sudo -n fuser -v $locks 2>&1; '
+                'sleep 10; elapsed=$((elapsed + 10)); '
+                'done'
+            ),
+            (
+                'dpkg-configure',
+                'sudo -n env DEBIAN_FRONTEND=noninteractive '
+                'NEEDRESTART_MODE=a APT_LISTCHANGES_FRONTEND=none '
+                'timeout --signal=TERM --kill-after=30s 15m '
+                'dpkg --configure -a'
+            ),
+            ('apt-update', f'{apt}update'),
+            (
+                'base-packages',
+                f'{apt}-y install build-essential cmake curl git '
+                'software-properties-common'
+            ),
+            (
+                'universe-repository',
+                'sudo -n env DEBIAN_FRONTEND=noninteractive '
+                'timeout --signal=TERM --kill-after=30s 5m '
+                'add-apt-repository -y -n universe'
+            ),
+            ('apt-update-universe', f'{apt}update'),
+            (
+                'clang-packages',
+                f'{apt}-y install clang-14 llvm-14 llvm-14-dev '
+                'libclang-14-dev'
+            ),
+            (
+                'rustup-install',
+                'if [ -x "$HOME/.cargo/bin/rustup" ]; then '
+                'echo "rustup is already installed"; '
+                'else installer=$(mktemp) && '
+                'trap \'rm -f "$installer"\' EXIT && '
+                'curl --proto "=https" --tlsv1.2 -fsS '
+                '--retry 5 --retry-delay 2 --retry-all-errors '
+                '--connect-timeout 30 --max-time 300 '
+                '-o "$installer" https://sh.rustup.rs && '
+                'timeout --signal=TERM --kill-after=30s 15m '
+                'sh "$installer" -y; fi'
+            ),
+            (
+                'rust-stable',
+                'for attempt in 1 2 3; do '
+                'timeout --signal=TERM --kill-after=30s 15m '
+                '"$HOME/.cargo/bin/rustup" default stable && exit 0; '
+                'rc=$?; echo "rustup attempt ${attempt}/3 failed '
+                '(exit=$rc)" >&2; sleep $((attempt * 5)); '
+                'done; exit "$rc"'
+            ),
+            (
+                'clang-alternatives',
+                'sudo -n update-alternatives --install /usr/bin/clang clang '
+                '/usr/bin/clang-14 140 && '
+                'sudo -n update-alternatives --install /usr/bin/clang++ clang++ '
+                '/usr/bin/clang++-14 140 && '
+                'sudo -n update-alternatives --set clang /usr/bin/clang-14 && '
+                'sudo -n update-alternatives --set clang++ /usr/bin/clang++-14'
+            ),
+            (
+                'compiler-environment',
+                'if ! grep -q "LIBCLANG_PATH=/usr/lib/llvm-14/lib" '
+                '"$HOME/.cargo/env"; then '
+                "printf '\\nexport PATH=/usr/lib/llvm-14/bin:$PATH\\n"
+                'export CC=/usr/bin/clang-14\\n'
+                'export CXX=/usr/bin/clang++-14\\n'
+                'export CLANG_PATH=/usr/bin/clang-14\\n'
+                'export LIBCLANG_PATH=/usr/lib/llvm-14/lib\\n'
+                "export CXXFLAGS=\"-include cstdint\"\\n' "
+                '>> "$HOME/.cargo/env"; fi'
+            ),
+            (
+                'repository',
+                f'if [ -d {repo_name}/.git ]; then '
+                'for attempt in 1 2 3; do '
+                f'timeout 10m git -C {repo_name} '
+                '-c http.lowSpeedLimit=1024 -c http.lowSpeedTime=60 '
+                f'fetch origin {repo_branch} && '
+                f'git -C {repo_name} checkout {repo_branch} && '
+                f'timeout 10m git -C {repo_name} '
+                '-c http.lowSpeedLimit=1024 -c http.lowSpeedTime=60 '
+                f'pull --ff-only origin {repo_branch} && exit 0; '
+                'rc=$?; echo "git pull attempt ${attempt}/3 failed '
+                '(exit=$rc)" >&2; sleep $((attempt * 5)); done; '
+                'exit "$rc"; '
+                f'elif [ -e {repo_name} ]; then '
+                f'echo "repository path already exists but is not a git repo: '
+                f'{repo_name}" >&2; exit 1; '
+                'else for attempt in 1 2 3; do '
+                'timeout 10m git -c http.lowSpeedLimit=1024 '
+                '-c http.lowSpeedTime=60 '
+                f'clone --branch {repo_branch} {repo_url} {repo_name} '
+                '&& exit 0; '
+                'rc=$?; echo "git clone attempt ${attempt}/3 failed '
+                '(exit=$rc)" >&2; sleep $((attempt * 5)); done; '
+                'exit "$rc"; fi'
+            )
         ]
-        hosts = self.manager.hosts(flat=True)
+
+    def _install_host(self, host, steps):
+        connection = None
+        step = 'connect'
+        output_tail = deque(maxlen=12)
         try:
-            g = Group(*hosts, user='ubuntu', connect_kwargs=self.connect)
-            g.run(' && '.join(cmd), hide=True)
-            Print.heading(f'Initialized testbed of {len(hosts)} nodes')
-        except (GroupException, ExecutionError) as e:
-            e = FabricError(e) if isinstance(e, GroupException) else e
-            raise BenchError('Failed to install repo on testbed', e)
+            self._install_status(host, step, 'START', 'attempts=5')
+            for attempt in range(1, 6):
+                connection = Connection(
+                    host,
+                    user='ubuntu',
+                    connect_kwargs=self.connect,
+                    connect_timeout=30
+                )
+                try:
+                    connection.open()
+                    self._install_status(
+                        host, step, 'OK', f'attempt={attempt}/5'
+                    )
+                    break
+                except Exception as e:
+                    try:
+                        connection.close()
+                    except Exception:
+                        pass
+                    connection = None
+                    if attempt == 5:
+                        raise
+                    delay = attempt * 5
+                    detail = str(e).strip().replace('\n', ' | ')
+                    self._install_status(
+                        host, step, 'RETRY',
+                        f'attempt={attempt}/5 wait={delay}s: {detail}'
+                    )
+                    sleep(delay)
+
+            for step, command in steps:
+                self._install_status(host, step, 'START')
+                output_tail = deque(maxlen=12)
+                stdout = _InstallOutput(
+                    host, step, sys.stdout, output_tail, 'stdout'
+                )
+                stderr = _InstallOutput(
+                    host, step, sys.stderr, output_tail, 'stderr'
+                )
+                heartbeat_stop = Event()
+
+                def heartbeat():
+                    elapsed = 0
+                    while not heartbeat_stop.wait(30):
+                        elapsed += 30
+                        self._install_status(
+                            host, step, 'RUNNING', f'elapsed={elapsed}s'
+                        )
+
+                heartbeat_thread = Thread(target=heartbeat, daemon=True)
+                heartbeat_thread.start()
+                try:
+                    result = connection.run(
+                        command,
+                        warn=True,
+                        hide=False,
+                        pty=False,
+                        in_stream=False,
+                        out_stream=stdout,
+                        err_stream=stderr
+                    )
+                finally:
+                    heartbeat_stop.set()
+                    heartbeat_thread.join()
+                    stdout.finish()
+                    stderr.finish()
+
+                if result.failed:
+                    detail = ' | '.join(output_tail) or 'no output'
+                    self._install_status(
+                        host, step, 'ERROR',
+                        f'exit={result.exited}: {detail}'
+                    )
+                    return step, f'exit={result.exited}: {detail}'
+                self._install_status(host, step, 'OK')
+
+            self._install_status(host, 'complete', 'OK')
+            return None
+        except Exception as e:
+            detail = str(e).strip().replace('\n', ' | ') or type(e).__name__
+            if output_tail:
+                detail += f'; last output: {" | ".join(output_tail)}'
+            self._install_status(
+                host, step, 'ERROR', f'{type(e).__name__}: {detail}'
+            )
+            return step, f'{type(e).__name__}: {detail}'
+        finally:
+            if connection is not None:
+                try:
+                    connection.close()
+                except Exception:
+                    pass
+
+    def install(self):
+        hosts = self.manager.hosts(flat=True)
+        if not hosts:
+            raise BenchError(
+                'Failed to install repo on testbed',
+                ExecutionError('No available hosts')
+            )
+
+        Print.info(
+            f'[INSTALL] Installing dependencies and cloning the repo on '
+            f'{len(hosts)} nodes...'
+        )
+        steps = self._install_steps()
+        failures = {}
+        completed = 0
+        with ThreadPoolExecutor(max_workers=len(hosts)) as executor:
+            futures = {
+                executor.submit(self._install_host, host, steps): host
+                for host in hosts
+            }
+            for future in as_completed(futures):
+                host = futures[future]
+                try:
+                    failure = future.result()
+                except Exception as e:
+                    failure = ('internal', f'{type(e).__name__}: {e}')
+                    self._install_status(
+                        host, failure[0], 'ERROR', failure[1]
+                    )
+                if failure:
+                    failures[host] = failure
+                completed += 1
+                with _INSTALL_OUTPUT_LOCK:
+                    print(
+                        f'[INSTALL] PROGRESS completed={completed}/{len(hosts)} '
+                        f'ok={completed - len(failures)} '
+                        f'failed={len(failures)}',
+                        flush=True
+                    )
+
+        succeeded = len(hosts) - len(failures)
+        Print.info(
+            f'[INSTALL] SUMMARY total={len(hosts)} '
+            f'ok={succeeded} failed={len(failures)}'
+        )
+        if failures:
+            details = []
+            for host in hosts:
+                if host in failures:
+                    step, reason = failures[host]
+                    line = f'{host}: step={step}; {reason}'
+                    details.append(line)
+                    Print.info(f'[INSTALL][{host}][summary] FAILED {line}')
+            raise BenchError(
+                'Failed to install repo on testbed',
+                ExecutionError('\n'.join(details))
+            )
+
+        Print.heading(f'Initialized testbed of {len(hosts)} nodes')
 
     def kill(self, hosts=[], delete_logs=False):
         assert isinstance(hosts, list)
