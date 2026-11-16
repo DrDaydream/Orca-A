@@ -69,6 +69,10 @@ struct State {
     grade_two: HashSet<Digest>,
     /// Digest index of blocks already present in the formal Dag.
     dag_digests: HashSet<Digest>,
+    /// Exact output history (including genesis). Header GC must not turn an
+    /// already ordered dependency back into missing data. Digests suffice:
+    /// subsequent causal walks stop here without retaining old headers.
+    ordered_digests: HashSet<Digest>,
     /// Every signature-verified certificate seen at any GRBC stage.
     observed: HashMap<Digest, Certificate>,
     /// O(1) lookup for an observed block selected by round and author.
@@ -162,7 +166,8 @@ impl State {
             .flat_map(|authorities| authorities.values())
             .map(|(digest, certificate)| (digest.clone(), certificate.clone()))
             .collect();
-        let dag_digests = dag_by_digest.keys().cloned().collect();
+        let dag_digests: HashSet<_> = dag_by_digest.keys().cloned().collect();
+        let ordered_digests = dag_digests.clone();
         let observed = genesis_dag
             .values()
             .flat_map(|authorities| authorities.values())
@@ -197,6 +202,7 @@ impl State {
             vdag: HashMap::new(),
             grade_two: HashSet::new(),
             dag_digests,
+            ordered_digests,
             observed,
             observed_by_round,
             strong_ancestors: HashMap::new(),
@@ -304,7 +310,7 @@ impl State {
         let mut visited = HashSet::new();
 
         for digest in &anchor.header.virtual_edges {
-            if !self.observed.contains_key(digest) {
+            if !self.observed.contains_key(digest) && !self.ordered_digests.contains(digest) {
                 snapshot.complete = false;
                 self.fallback_evidence_waiters
                     .entry(digest.clone())
@@ -313,7 +319,10 @@ impl State {
             }
         }
         while let Some(digest) = pending.pop() {
-            if !visited.insert(digest.clone()) {
+            // The unresolved target is after the finalized output prefix.
+            // An ordered vertex and its closed causal past cannot contribute
+            // new round-(target+3) votes, and may already have been pruned.
+            if self.ordered_digests.contains(&digest) || !visited.insert(digest.clone()) {
                 continue;
             }
             let (vertex_round, virtual_edges, dependencies) = match self.observed.get(&digest) {
@@ -352,7 +361,9 @@ impl State {
                 .or_default()
                 .push(digest.clone());
             for virtual_digest in virtual_edges {
-                if !self.observed.contains_key(&virtual_digest) {
+                if !self.observed.contains_key(&virtual_digest)
+                    && !self.ordered_digests.contains(&virtual_digest)
+                {
                     snapshot.complete = false;
                     self.fallback_evidence_waiters
                         .entry(virtual_digest)
@@ -492,7 +503,7 @@ impl State {
         let mut visited = HashSet::new();
         while let Some(certificate) = pending.pop() {
             let digest = certificate.digest();
-            if !visited.insert(digest.clone()) {
+            if self.ordered_digests.contains(&digest) || !visited.insert(digest.clone()) {
                 continue;
             }
             for dependency in certificate
@@ -504,7 +515,10 @@ impl State {
                 // With complete history, shared Dag ancestors need no repeat
                 // traversal. While a force-admission gap remains, traverse
                 // them so this owner also waits for any shared missing history.
-                if self.dag_digests.contains(dependency) && self.forced_history_waiters.is_empty() {
+                if self.ordered_digests.contains(dependency)
+                    || (self.dag_digests.contains(dependency)
+                        && self.forced_history_waiters.is_empty())
+                {
                     continue;
                 } else if let Some(ancestor) = self.observed.get(dependency).cloned() {
                     pending.push(ancestor);
@@ -544,7 +558,10 @@ impl State {
                 .parents
                 .iter()
                 .chain(&certificate.header.weak_edges)
-                .filter(|dependency| !self.dag_digests.contains(*dependency))
+                .filter(|dependency| {
+                    !self.dag_digests.contains(*dependency)
+                        && !self.ordered_digests.contains(*dependency)
+                })
                 .cloned()
                 .collect();
             for dependency in &missing {
@@ -699,7 +716,18 @@ impl State {
     /// ordered sequence. Repeating full-map retain for every certificate made
     /// a large commit batch quadratic even after `order_dag` became linear.
     fn update(&mut self, certificates: &[Certificate], gc_depth: Round) {
+        let mut frontier_changed = false;
         for certificate in certificates {
+            let digest = certificate.digest();
+            if self.ordered_digests.insert(digest.clone()) {
+                if !frontier_changed {
+                    self.fallback_evidence_version = self.fallback_evidence_version.wrapping_add(1);
+                    frontier_changed = true;
+                }
+                // Reuse the existing reverse indexes: only anchors whose
+                // traversed or missing evidence became ordered need a retry.
+                self.mark_fallback_digest_changed(&digest);
+            }
             self.last_committed
                 .entry(certificate.origin())
                 .and_modify(|r| *r = max(*r, certificate.round()))
@@ -1691,6 +1719,9 @@ impl Consensus {
                 }
             }
             self.evaluate_dirty_fallback_anchors(state).await;
+            // Output changes the causal traversal frontier and can invalidate
+            // another lane's snapshot. Consume that work in this same event.
+            self.drain_ready_leaders(state).await;
             if state.dirty_leaders.is_empty()
                 && state.dirty_fallback_anchors.is_empty()
                 && state.promotion_queue.is_empty()
@@ -1698,7 +1729,6 @@ impl Consensus {
                 break;
             }
         }
-        self.drain_ready_leaders(state).await;
     }
 
     fn observed_leader(&self, round: Round, state: &State) -> Option<Certificate> {

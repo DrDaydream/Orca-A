@@ -24,10 +24,11 @@ def main():
     parser.add_argument('--scenario', choices=['all', 'silent', 'late'], default='all')
     parser.add_argument('--duration', type=float, default=12)
     parser.add_argument('--nodes', type=int, default=4)
+    parser.add_argument('--gc-depth', type=int, default=50)
     parser.add_argument('--output', type=Path)
     args = parser.parse_args()
-    if args.nodes < 4 or args.nodes > 200 or args.duration < 6:
-        parser.error('Use 4..200 nodes and duration >= 6 seconds')
+    if args.nodes < 4 or args.nodes > 200 or args.duration < 6 or args.gc_depth < 1:
+        parser.error('Use 4..200 nodes, duration >= 6 seconds and gc-depth >= 1')
     binary = args.binary.resolve(strict=True)
     root = args.output.resolve() if args.output else Path(tempfile.mkdtemp(prefix='orca-grbc-'))
     root.mkdir(parents=True, exist_ok=True)
@@ -56,7 +57,7 @@ def main():
         }
     (root / 'committee.json').write_text(json.dumps({'authorities': authorities}))
     (root / 'parameters.json').write_text(json.dumps({
-        'header_size': 32, 'max_header_delay': 100, 'gc_depth': 200,
+        'header_size': 32, 'max_header_delay': 100, 'gc_depth': args.gc_depth,
         'sync_retry_delay': 200, 'sync_retry_nodes': 3,
         'batch_size': 4096, 'max_batch_delay': 50,
     }))
@@ -130,7 +131,7 @@ def main():
         records.append({'node': node, 'committed_blocks': len(sequence), 'payload_commits': len(payloads), 'last_round': int(sequence[-1][0]), 'last_commit_age_seconds': round(progress_age, 3)})
     shared = min(map(len, sequences))
     assert all(sequence[:shared] == sequences[0][:shared] for sequence in sequences), f'Commit order differs; see {root}'
-    result = {'scenario': args.scenario, 'committee_size': args.nodes, 'duration_seconds': args.duration, 'sent_transactions': sent, 'common_commit_prefix': shared,
+    result = {'scenario': args.scenario, 'committee_size': args.nodes, 'gc_depth': args.gc_depth, 'duration_seconds': args.duration, 'sent_transactions': sent, 'common_commit_prefix': shared,
               'max_round_lag': max(record['last_round'] for record in records) - min(record['last_round'] for record in records),
               'nodes': records, 'logs': str(root), 'passed': True}
     (root / 'result.json').write_text(json.dumps(result, indent=2))

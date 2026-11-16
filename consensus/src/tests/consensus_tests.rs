@@ -825,6 +825,195 @@ fn fallback_history_is_reused_at_the_same_version() {
     assert_eq!(second.by_round.get(&99), Some(&vec![marker]));
 }
 
+#[tokio::test]
+async fn fallback_keeps_finalizing_after_committed_history_is_garbage_collected() {
+    let committee = mock_committee();
+    let (tx_primary, _rx_primary) = channel(1000);
+    let (tx_output, mut rx_output) = channel(1000);
+    let mut consensus = Consensus {
+        committee: committee.clone(),
+        gc_depth: 50,
+        rx_primary: channel(1).1,
+        tx_primary,
+        tx_output: OutputSender::Individual(tx_output),
+        genesis: Certificate::genesis(&committee),
+    };
+    let mut state = State::new(Certificate::genesis(&committee));
+    let mut authorities: Vec<_> = keys().into_iter().map(|(key, _)| key).collect();
+    authorities.sort();
+    let mut parents: BTreeSet<_> = consensus.genesis.iter().map(|c| c.digest()).collect();
+    let mut leaders = BTreeMap::new();
+    let mut first_round = Vec::new();
+    for round in 1..=56 {
+        let mut next_parents = BTreeSet::new();
+        for authority in &authorities {
+            let (digest, certificate) = mock_certificate(*authority, round, parents.clone());
+            if round == 1 {
+                first_round.push(digest.clone());
+            }
+            if *authority == consensus.ordering_leader_authority(round) {
+                leaders.insert(round, certificate.clone());
+            }
+            state.observe(certificate.clone());
+            state.promote_to_dag(certificate);
+            next_parents.insert(digest);
+        }
+        if round <= 52 {
+            consensus
+                .queue_leader_commit(leaders[&round].clone(), 3, &mut state)
+                .await;
+        }
+        parents = next_parents;
+    }
+    while rx_output.try_recv().is_ok() {}
+    assert_eq!(state.finalized_round, 52);
+    assert!(first_round
+        .iter()
+        .all(|digest| !state.observed.contains_key(digest)));
+
+    // Round 56 is a Good anchor for pending round 53 on the same lane.
+    // Its causal suffix is complete; deleted ancestors below the finalized
+    // prefix cannot change the direct strong-path decision for round 53.
+    consensus
+        .queue_leader_commit(leaders[&56].clone(), 1, &mut state)
+        .await;
+
+    assert!(
+        state.committed_leaders.contains(&53),
+        "GC must not strand the next fallback leader"
+    );
+    assert_eq!(state.finalized_round, 53);
+    let mut emitted = Vec::new();
+    while let Ok(certificate) = rx_output.try_recv() {
+        emitted.push(certificate);
+    }
+    assert!(emitted
+        .iter()
+        .any(|certificate| certificate.digest() == leaders[&53].digest()));
+    assert!(
+        !state.committed_leaders.contains(&56),
+        "the unresolved 54/55 prefix still blocks 56"
+    );
+}
+
+#[test]
+fn forced_history_does_not_retrieve_an_already_ordered_pruned_ancestor() {
+    let committee = mock_committee();
+    let mut state = State::new(Certificate::genesis(&committee));
+    let authorities: Vec<_> = keys().into_iter().map(|(key, _)| key).collect();
+    let genesis = state.dag_digests.iter().cloned().collect();
+    let (old_digest, old) = mock_certificate(authorities[0], 1, genesis);
+    state.observe(old.clone());
+    state.promote_to_dag(old.clone());
+    state.update(&[old], 2);
+    let (_, newer) = mock_certificate(authorities[0], 4, BTreeSet::new());
+    state.observe(newer.clone());
+    state.promote_to_dag(newer.clone());
+    state.update(&[newer], 2);
+    assert!(!state.observed.contains_key(&old_digest));
+    assert!(!state.dag_by_digest.contains_key(&old_digest));
+
+    let (_, mut leader) = mock_certificate(authorities[1], 5, BTreeSet::new());
+    leader.header.weak_edges.insert(old_digest);
+    state.force_observed_history_to_dag(leader, 5);
+
+    assert!(
+        state.forced_history_waiters.is_empty(),
+        "an already emitted ancestor needs neither retrieval nor repeated traversal"
+    );
+}
+
+#[test]
+fn finish_after_gc_accepts_an_exact_ordered_dependency_but_waits_for_unknown_data() {
+    let committee = mock_committee();
+    let mut state = State::new(Certificate::genesis(&committee));
+    let authorities: Vec<_> = keys().into_iter().map(|(key, _)| key).collect();
+    let (old_digest, old) = mock_certificate(authorities[0], 1, BTreeSet::new());
+    state.observe(old.clone());
+    state.promote_to_dag(old.clone());
+    state.update(&[old], 2);
+    let (_, newer) = mock_certificate(authorities[0], 4, BTreeSet::new());
+    state.observe(newer.clone());
+    state.promote_to_dag(newer.clone());
+    state.update(&[newer], 2);
+    assert!(!state.observed.contains_key(&old_digest));
+
+    let (_, mut child) = mock_certificate(authorities[1], 5, BTreeSet::new());
+    child.header.weak_edges.insert(old_digest);
+    let child_digest = child.digest();
+    state.insert_grade_one(child);
+    state.mark_grade_two(child_digest.clone());
+    state.promote_ready();
+    assert!(
+        state.dag_digests.contains(&child_digest),
+        "pruning metadata must not undo acceptance of an ordered dependency"
+    );
+
+    let (unknown_digest, _) = mock_certificate(authorities[0], 2, BTreeSet::new());
+    let (_, mut unknown_child) = mock_certificate(authorities[2], 5, BTreeSet::new());
+    unknown_child.header.weak_edges.insert(unknown_digest);
+    let unknown_child_digest = unknown_child.digest();
+    state.insert_grade_one(unknown_child);
+    state.mark_grade_two(unknown_child_digest.clone());
+    state.promote_ready();
+    assert!(
+        !state.dag_digests.contains(&unknown_child_digest),
+        "an author's later watermark is not evidence for an unknown digest"
+    );
+}
+
+#[tokio::test]
+async fn ordered_frontier_rechecks_cached_fallback_without_another_message() {
+    let committee = mock_committee();
+    let (tx_primary, _rx_primary) = channel(100);
+    let (tx_output, _rx_output) = channel(100);
+    let mut consensus = Consensus {
+        committee: committee.clone(),
+        gc_depth: 50,
+        rx_primary: channel(1).1,
+        tx_primary,
+        tx_output: OutputSender::Individual(tx_output),
+        genesis: Certificate::genesis(&committee),
+    };
+    let mut state = State::new(Certificate::genesis(&committee));
+    let mut authorities: Vec<_> = keys().into_iter().map(|(key, _)| key).collect();
+    authorities.sort();
+    let (_, mut first) = mock_certificate(authorities[0], 1, BTreeSet::new());
+    // Virtual evidence is not causal output history. It blocks a snapshot
+    // before this vertex is ordered, then becomes irrelevant to later targets.
+    first.header.virtual_edges.insert(Digest::default());
+    let mut parent = first.digest();
+    state.observe(first.clone());
+    state.promote_to_dag(first.clone());
+    for round in 2..=4 {
+        let (digest, vertex) =
+            mock_certificate(authorities[1], round, [parent].iter().cloned().collect());
+        state.observe(vertex.clone());
+        state.promote_to_dag(vertex);
+        parent = digest;
+    }
+    let (_, anchor) = mock_certificate(authorities[0], 5, [parent].iter().cloned().collect());
+    state.observe(anchor.clone());
+    state.promote_to_dag(anchor.clone());
+    consensus
+        .queue_leader_commit(anchor.clone(), 1, &mut state)
+        .await;
+    assert!(!state.fallback_history_snapshot(&anchor).complete);
+    assert!(!state.skipped_leaders.contains(&2));
+
+    consensus.stage_leader_commit(first, 3, &mut state);
+    consensus.process_dirty_leaders(&mut state).await;
+
+    assert!(
+        state.skipped_leaders.contains(&2),
+        "ordering a traversed vertex must invalidate and retry its cached incomplete snapshot"
+    );
+    assert_eq!(
+        state.finalized_round, 2,
+        "the existing event must drain work caused by the new ordered frontier"
+    );
+}
+
 #[test]
 fn awaited_fallback_digest_dirties_only_its_anchor() {
     let committee = mock_committee();

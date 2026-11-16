@@ -105,3 +105,41 @@ Each real-process smoke ran for 12 seconds using default Tokio thread counts. Al
 | 10 nodes, all present | 10 | 1,672 | 0 |
 
 This remains an experimental implementation. Leader selection uses the repository's deterministic schedule, not the paper's threshold GPC; this branch does not establish the full cryptographic GPC or orchestration-resistance claim. The supplied paper's prose takes precedence where its draft pseudocode is inconsistent.
+
+### GC boundary regression — 2026-11-17
+
+A four-node run with 20-byte headers, GC depth 50 and 50,000 tx/s exposed a
+finalization plateau around round 52. New proposals continued, but fallback
+history traversal treated already-ordered, pruned ancestors as missing data.
+The earlier small-load smoke used GC depth 200 and did not exercise this boundary.
+
+Consensus now retains exact ordered digests (including genesis) as a causal
+traversal frontier. It stops repeating history walks at that frontier, accepts
+those exact dependencies after header GC, and still waits for unknown digests.
+New output invalidates only affected fallback snapshots through the existing
+reverse indexes, and the same event processes the resulting work. No quorum,
+GDP decision, consecutive-prefix, or wire-format rule changes are required.
+The compact ledger retains one digest per emitted vertex, rather than headers
+or payloads; its memory grows with total output and is not bounded by GC depth.
+
+Four new regressions failed before their respective fixes and now pass. The
+release workspace suite passes 142 tests (one manual microbenchmark ignored).
+The smoke script now defaults to GC depth 50, configurable with --gc-depth.
+One-absent, one-late and ten-node smokes all pass with common prefixes of 559,
+684 and 1,774 headers. The ten-node shutdown snapshot has a two-round tail lag;
+all replicas agree on the shared prefix and continue making progress.
+
+Windows loopback runs with the user's configuration and default threads:
+
+| Run | Fixed-window TPS | Completed/sent samples | Last committed round |
+| --- | ---: | ---: | ---: |
+| Before fix, 20 s | 8,789.1 | 282 / 1,600 | 52 (stalled) |
+| Corrected candidate, 20 s | 46,389.9 | 1,486 / 1,600 | 272 |
+| Corrected candidate, 60 s | 47,389.1 | 4,555 / 4,800 | 796 |
+
+The two corrected runs have no client rate warnings and agree across all four
+replicas. Their fixed-window final consensus/end-to-end means are 281.8/325.1 ms
+and 292.5/341.0 ms respectively. These results demonstrate recovery of sustained
+output on this host. The old latency excludes nearly all post-stall requests,
+so comparing its mean directly to a full successful run is misleading. They
+do not establish an Ubuntu/WAN latency improvement.
