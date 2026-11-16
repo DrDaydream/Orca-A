@@ -418,6 +418,222 @@ async fn helper_recovers_complete_proposal_before_local_ready() {
 }
 
 #[tokio::test]
+async fn helper_reuses_queued_payload_but_refreshes_votes() {
+    use crate::helper::{Helper, RepairRequest};
+    use std::sync::{Arc, Mutex};
+    use store::StoreCommand;
+    use tokio::time::{timeout, Duration};
+
+    let p = with_payload();
+    let digest = p.block().digest();
+    let echo = crate::common::votes(&p.header, GrbcPhase::Echo).remove(0);
+    let ready = crate::common::votes(&p.header, GrbcPhase::Ready).remove(0);
+    let expected_votes = vec![vec![echo], vec![ready]];
+    let reads = Arc::new(Mutex::new(Vec::new()));
+    let (tx_store, mut rx_store) = channel(10);
+    let read_log = reads.clone();
+    let stored = p.clone();
+    let served_votes = expected_votes.clone();
+    let vote_key = local_votes_key(&digest);
+    let header_key = proposal_header_key(&digest);
+    let actor = tokio::spawn(async move {
+        let mut vote_reads = 0;
+        while let Some(command) = rx_store.recv().await {
+            if let StoreCommand::Read(key, response) = command {
+                read_log.lock().unwrap().push(key.clone());
+                let data = if key == vote_key {
+                    let bytes = bincode::serialize(&served_votes[vote_reads.min(1)]).unwrap();
+                    vote_reads += 1;
+                    bytes
+                } else if key == header_key {
+                    bincode::serialize(&stored.header).unwrap()
+                } else {
+                    stored
+                        .batches
+                        .iter()
+                        .find(|(d, _)| batch_key(d) == key)
+                        .expect("unexpected payload lookup")
+                        .1
+                        .clone()
+                };
+                response.send(Ok(Some(data))).unwrap();
+            } else {
+                panic!("repair should only read storage");
+            }
+        }
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let requestor = keys()[1].0;
+    let mut c = committee();
+    c.authorities
+        .get_mut(&requestor)
+        .unwrap()
+        .primary
+        .primary_to_primary = listener.local_addr().unwrap();
+    let (tx, rx) = channel(10);
+    let (tx_votes, mut rx_votes) = channel(10);
+    // Both requests are pending before Helper starts: no timing-based sleeps.
+    for _ in 0..2 {
+        tx.send(RepairRequest::Proposals(vec![digest.clone()], requestor))
+            .await
+            .unwrap();
+    }
+    Helper::spawn(c, Store::from_channel(tx_store), rx, tx_votes);
+    let (socket, _) = timeout(Duration::from_secs(5), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut stream = Framed::new(socket, LengthDelimitedCodec::new());
+    for expected in expected_votes {
+        let frame = timeout(Duration::from_secs(5), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let rebuilt = match bincode::deserialize::<PrimaryMessage>(&frame).unwrap() {
+            PrimaryMessage::Proposal(p) => p,
+            _ => panic!("expected a complete proposal repair"),
+        };
+        assert_eq!(rebuilt.header, p.header);
+        assert_eq!(rebuilt.batches, p.batches);
+        stream.send(Bytes::from_static(b"Ack")).await.unwrap();
+        let dispatch = timeout(Duration::from_secs(5), rx_votes.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(dispatch.requestor, Some(requestor));
+        assert_eq!(
+            bincode::serialize(&dispatch.votes).unwrap(),
+            bincode::serialize(&expected).unwrap()
+        );
+    }
+    let observed_reads = reads.lock().unwrap().clone();
+    assert_eq!(
+        observed_reads
+            .iter()
+            .filter(|key| **key == local_votes_key(&digest))
+            .count(),
+        2,
+        "later READY votes must be fetched for every repair request"
+    );
+    assert_eq!(
+        observed_reads
+            .iter()
+            .filter(|key| **key == proposal_header_key(&digest))
+            .count(),
+        1,
+        "queued requests for the same immutable proposal must not reread its header"
+    );
+    for batch in p.batches.keys() {
+        assert_eq!(
+            observed_reads
+                .iter()
+                .filter(|key| **key == batch_key(batch))
+                .count(),
+            1,
+            "queued requests must reuse payload bytes instead of rereading each batch"
+        );
+    }
+    // Receiving both frames on this current-thread runtime means Helper has
+    // finished the queued requests and yielded waiting on the empty channel.
+    tx.send(RepairRequest::Proposals(vec![digest.clone()], requestor))
+        .await
+        .unwrap();
+    let frame = timeout(Duration::from_secs(5), stream.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        frame.as_ref(),
+        bincode::serialize(&PrimaryMessage::Proposal(p.clone())).unwrap()
+    );
+    let dispatch = timeout(Duration::from_secs(5), rx_votes.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(dispatch.votes[0].phase, GrbcPhase::Ready));
+    let reads = reads.lock().unwrap();
+    assert_eq!(
+        reads
+            .iter()
+            .filter(|key| **key == proposal_header_key(&digest))
+            .count(),
+        2,
+        "the cached payload must be released once the request queue is empty"
+    );
+    for batch in p.batches.keys() {
+        assert_eq!(
+            reads.iter().filter(|key| **key == batch_key(batch)).count(),
+            2
+        );
+    }
+    actor.abort();
+}
+
+#[tokio::test]
+async fn helper_never_reuses_payload_for_a_different_or_missing_digest() {
+    use crate::helper::{Helper, RepairRequest};
+    use tokio::time::{timeout, Duration};
+
+    let first = with_payload();
+    let mut second = first.clone();
+    second.header.round += 1;
+    second.header.id = second.header.digest();
+    second.header.signature = Signature::new(&second.header.id, &keys().pop().unwrap().1);
+    second.verify(&committee()).unwrap();
+    let mut storage = store("helper_distinct_payloads");
+    for p in [first.clone(), second.clone()] {
+        store_verified_proposal(&mut storage, p).await.unwrap();
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let requestor = keys()[1].0;
+    let mut c = committee();
+    c.authorities
+        .get_mut(&requestor)
+        .unwrap()
+        .primary
+        .primary_to_primary = listener.local_addr().unwrap();
+    let (tx, rx) = channel(10);
+    let (tx_votes, _rx_votes) = channel(10);
+    let missing = Digest([123; 32]);
+    assert_ne!(missing, first.block().digest());
+    assert_ne!(missing, second.block().digest());
+    tx.send(RepairRequest::Proposals(
+        vec![
+            first.block().digest(),
+            missing,
+            second.block().digest(),
+            first.block().digest(),
+        ],
+        requestor,
+    ))
+    .await
+    .unwrap();
+    Helper::spawn(c, storage, rx, tx_votes);
+    let (socket, _) = timeout(Duration::from_secs(5), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut stream = Framed::new(socket, LengthDelimitedCodec::new());
+    for expected in [first.clone(), second, first] {
+        let frame = timeout(Duration::from_secs(5), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let p = match bincode::deserialize::<PrimaryMessage>(&frame).unwrap() {
+            PrimaryMessage::Proposal(p) => p,
+            _ => panic!("expected complete proposal"),
+        };
+        assert_eq!(p.header, expected.header);
+        assert_eq!(p.batches, expected.batches);
+        p.verify(&committee()).unwrap();
+        stream.send(Bytes::from_static(b"Ack")).await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn proposal_processor_rejects_changed_bytes_even_for_a_known_header() {
     let mut store = store("processor_revalidation");
     let p = with_payload();

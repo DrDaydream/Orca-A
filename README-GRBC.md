@@ -1,5 +1,11 @@
 # Orca-A complete-proposal GRBC branch
 
+**Experimental branch notice:** orca-a-repair-reuse-experiment reuses the
+last serialized complete proposal during queued repair requests. Repeated
+work is reduced, but lower final latency with maintained throughput remains
+unproven. The recommended branch remains orca-a-grbc-echo-ready at 008ad5d.
+See docs/experiments/repair-reuse-2026-11-17.md for all measured outcomes.
+
 This branch starts at Orca-A `54bd1f29fc03414a16da7044e5eb31df92e6212b` and ports the retained broadcast and benchmark changes from Orca-B `a309da2`. The protocol reference is the supplied Orca draft, Section II (GRBC), Section IV (Orca-A), and Algorithm 5 (ordered output). Orca-A keeps its Good, Deferred, and three `r mod 3` pessimistic recovery lanes. It has no ABA subsystem.
 
 ## Broadcast and storage

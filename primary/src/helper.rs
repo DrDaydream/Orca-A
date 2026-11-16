@@ -50,7 +50,16 @@ impl Helper {
     }
 
     async fn run(&mut self) {
-        while let Some(request) = self.rx_primaries.recv().await {
+        // Retain at most the last immutable payload while work is queued.
+        // Votes remain live reads: a later request may need a newly saved READY.
+        let mut last_payload: Option<(Digest, Bytes)> = None;
+        loop {
+            if self.rx_primaries.is_empty() {
+                last_payload = None;
+            }
+            let Some(request) = self.rx_primaries.recv().await else {
+                break;
+            };
             let (digests, origin, include_payload) = match request {
                 RepairRequest::Proposals(digests, origin) => (digests, origin, true),
                 RepairRequest::Votes(digests, origin) => (digests, origin, false),
@@ -89,6 +98,14 @@ impl Helper {
                 if !include_payload {
                     continue;
                 }
+                if let Some((cached_digest, bytes)) = &last_payload {
+                    if cached_digest == &digest {
+                        self.network.send(address, bytes.clone()).await;
+                        continue;
+                    }
+                }
+                // Never keep an older entry across a different or absent digest.
+                last_payload = None;
                 match load_proposal(&mut self.store, &digest).await {
                     Ok(Some(proposal)) => {
                         let bytes = tokio::task::spawn_blocking(move || {
@@ -97,7 +114,9 @@ impl Helper {
                         .await
                         .expect("Proposal response task failed")
                         .expect("Failed to serialize proposal response");
-                        self.network.send(address, Bytes::from(bytes)).await;
+                        let bytes = Bytes::from(bytes);
+                        self.network.send(address, bytes.clone()).await;
+                        last_payload = Some((digest, bytes));
                     }
                     Ok(None) => (),
                     Err(e) => error!("{}", e),
