@@ -923,6 +923,107 @@ fn forced_history_does_not_retrieve_an_already_ordered_pruned_ancestor() {
     );
 }
 
+#[tokio::test]
+async fn late_weak_history_survives_gc_until_its_exact_vertex_is_output() {
+    let committee = mock_committee();
+    let (tx_primary, _rx_primary) = channel(1000);
+    let (tx_output, mut rx_output) = channel(1000);
+    let mut consensus = Consensus {
+        committee: committee.clone(),
+        gc_depth: 50,
+        rx_primary: channel(1).1,
+        tx_primary,
+        tx_output: OutputSender::Individual(tx_output),
+        genesis: Certificate::genesis(&committee),
+    };
+    let mut state = State::new(Certificate::genesis(&committee));
+    let mut authorities: Vec<_> = keys().into_iter().map(|(key, _)| key).collect();
+    authorities.sort();
+    let genesis: BTreeSet<_> = consensus.genesis.iter().map(Certificate::digest).collect();
+    let (old_digest, old) = mock_certificate(authorities[3], 1, genesis.clone());
+    state.observe(old.clone());
+    state.promote_to_dag(old.clone());
+    let mut parents = genesis;
+    for round in 1..=52 {
+        let mut next = BTreeSet::new();
+        let mut leader = None;
+        for authority in &authorities[..3] {
+            let (digest, block) = mock_certificate(*authority, round, parents.clone());
+            if *authority == consensus.ordering_leader_authority(round) {
+                leader = Some(block.clone());
+            }
+            state.observe(block.clone());
+            state.promote_to_dag(block);
+            next.insert(digest);
+        }
+        consensus
+            .queue_leader_commit(leader.unwrap(), 3, &mut state)
+            .await;
+        parents = next;
+    }
+    while rx_output.try_recv().is_ok() {}
+    assert_eq!(state.finalized_round, 52);
+    assert!(!state.ordered_digests.contains(&old_digest));
+    let (_, mut leader) = mock_certificate(authorities[0], 53, parents);
+    leader.header.weak_edges.insert(old_digest.clone());
+    consensus
+        .queue_leader_commit(leader.clone(), 3, &mut state)
+        .await;
+    let mut emitted = Vec::new();
+    while let Ok(block) = rx_output.try_recv() {
+        emitted.push(block.digest());
+    }
+    assert!(
+        emitted.contains(&old_digest),
+        "an unoutput old weak ancestor must be retained and actually emitted, not skipped by age"
+    );
+    assert!(emitted.contains(&leader.digest()));
+    assert!(state.ordered_digests.contains(&old_digest));
+    assert_eq!(state.finalized_round, 53);
+}
+
+#[tokio::test]
+async fn older_unoutput_vertex_is_not_hidden_by_its_authors_newer_watermark() {
+    let committee = mock_committee();
+    let (tx_primary, _rx_primary) = channel(100);
+    let (tx_output, mut rx_output) = channel(100);
+    let mut consensus = Consensus {
+        committee: committee.clone(),
+        gc_depth: 50,
+        rx_primary: channel(1).1,
+        tx_primary,
+        tx_output: OutputSender::Individual(tx_output),
+        genesis: Certificate::genesis(&committee),
+    };
+    let mut state = State::new(Certificate::genesis(&committee));
+    let origin = keys()[1].0;
+    let (old_digest, old) = mock_certificate(origin, 1, BTreeSet::new());
+    let (_, newer) = mock_certificate(origin, 4, BTreeSet::new());
+    state.observe(old.clone());
+    state.promote_to_dag(old);
+    state.observe(newer.clone());
+    state.promote_to_dag(newer.clone());
+    state.update(&[newer], 50);
+    state.finalized_round = 4;
+    let (_, mut leader) =
+        mock_certificate(consensus.ordering_leader_authority(5), 5, BTreeSet::new());
+    leader.header.weak_edges.insert(old_digest.clone());
+    consensus
+        .queue_leader_commit(leader.clone(), 3, &mut state)
+        .await;
+    let emitted: Vec<_> = std::iter::from_fn(|| rx_output.try_recv().ok())
+        .map(|c| c.digest())
+        .collect();
+    assert_eq!(
+        emitted,
+        vec![old_digest.clone(), leader.digest()],
+        "only exact prior output can suppress an ancestor, not a newer round from the same author"
+    );
+    assert!(state.ordered_digests.contains(&old_digest));
+    consensus.queue_leader_commit(leader, 3, &mut state).await;
+    assert!(rx_output.try_recv().is_err());
+}
+
 #[test]
 fn finish_after_gc_accepts_an_exact_ordered_dependency_but_waits_for_unknown_data() {
     let committee = mock_committee();

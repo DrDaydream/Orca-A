@@ -54,11 +54,11 @@ struct State {
     finalized_round: Round,
     /// The last committed round.
     last_committed_round: Round,
-    // Keeps the last committed round for each authority. This map is used to clean up the dag and
-    // ensure we don't commit twice the same certificate.
+    // Per-author highest output round, used for GC and progress reporting.
+    // Only ordered_digests proves whether an exact vertex was already output.
     last_committed: HashMap<PublicKey, Round>,
-    /// Keeps the latest committed certificate (and its parents) for every authority. Anything older
-    /// must be regularly cleaned up through the function `update`.
+    /// Accepted history not yet output, plus recent committed certificates.
+    /// Only exact output makes a vertex eligible for pruning in `update`.
     dag: Dag,
     /// Direct lookup used by causal traversal. This keeps `order_dag` linear
     /// in the number of visited vertices and edges.
@@ -738,16 +738,25 @@ impl State {
         self.last_committed_round = last_committed_round;
 
         let last_committed = &self.last_committed;
-        self.dag.retain(|r, authorities| {
-            authorities.retain(|name, _| last_committed.get(name).map_or(true, |round| r >= round));
-            !authorities.is_empty() && *r + gc_depth >= last_committed_round
+        let ordered_digests = &self.ordered_digests;
+        for dag in [&mut self.dag, &mut self.vdag] {
+            dag.retain(|r, authorities| {
+                authorities.retain(|name, (digest, _)| {
+                    !ordered_digests.contains(digest)
+                        || (last_committed.get(name).map_or(true, |round| r >= round)
+                            && *r + gc_depth >= last_committed_round)
+                });
+                !authorities.is_empty()
+            });
+        }
+        // Unordered data can still be a later weak ancestor or virtual
+        // evidence, regardless of its age or a newer block from its author.
+        // Only exact output closes that obligation; retain header metadata
+        // until then while continuing to prune old ordered history.
+        self.observed.retain(|digest, certificate| {
+            !ordered_digests.contains(digest)
+                || certificate.round() + gc_depth >= last_committed_round
         });
-        self.vdag.retain(|r, authorities| {
-            authorities.retain(|name, _| last_committed.get(name).map_or(true, |round| r >= round));
-            !authorities.is_empty() && *r + gc_depth >= last_committed_round
-        });
-        self.observed
-            .retain(|_, certificate| certificate.round() + gc_depth >= last_committed_round);
         let observed_digests: HashSet<_> = self.observed.keys().cloned().collect();
         self.strong_ancestors
             .retain(|digest, _| observed_digests.contains(digest));
@@ -1922,15 +1931,10 @@ impl Consensus {
                 .pending_order
                 .remove(&ready_round)
                 .unwrap_or_else(|| self.order_dag(&leader, state));
-            // A preordered successor may overlap with history committed by its
-            // predecessor in the meantime. Apply only the cheap watermark
-            // filter here; the expensive graph traversal remains precomputed.
-            sequence.retain(|certificate| {
-                state
-                    .last_committed
-                    .get(&certificate.origin())
-                    .map_or(true, |round| certificate.round() > *round)
-            });
+            // A preordered successor may overlap with newly emitted history.
+            // A newer round from the same author does not prove this exact
+            // vertex was output: late weak ancestors must still be emitted.
+            sequence.retain(|certificate| !state.ordered_digests.contains(&certificate.digest()));
             let _commit_rule = state.leader_commit_rules.remove(&ready_round).unwrap_or(3);
             #[cfg(feature = "benchmark")]
             info!(
@@ -2123,6 +2127,9 @@ impl Consensus {
 
         let mut buffer = vec![leader];
         while let Some(x) = buffer.pop() {
+            if state.ordered_digests.contains(&x.digest()) {
+                continue;
+            }
             sampled_debug!(x.round(), "Sequencing {:?}", x);
             ordered.push(x.clone());
             // Final ordering follows only strong and weak causal history.
@@ -2131,25 +2138,17 @@ impl Consensus {
             for parent in x.header.parents.iter().chain(&x.header.weak_edges) {
                 let certificate = match state.dag_by_digest.get(parent) {
                     Some(certificate) => certificate,
-                    None => continue, // We already ordered or GC up to here.
+                    // The forced-history output barrier handles unknown data;
+                    // exact ordered history may already have been pruned.
+                    None => continue,
                 };
 
-                // We skip the certificate if we (1) already processed it or (2) we reached a round that we already
-                // committed for this authority.
-                let mut skip = already_ordered.contains(parent);
-                skip |= state
-                    .last_committed
-                    .get(&certificate.origin())
-                    .map_or_else(|| false, |r| certificate.round() <= *r);
-                if !skip {
+                if !state.ordered_digests.contains(parent) && already_ordered.insert(parent.clone())
+                {
                     buffer.push(certificate);
-                    already_ordered.insert(parent.clone());
                 }
             }
         }
-
-        // Ensure we do not commit garbage collected certificates.
-        ordered.retain(|x| x.round() + self.gc_depth >= state.last_committed_round);
 
         // All causal edges point to lower rounds. Round order is topological;
         // break same-round ties by proposer as specified by Algorithm 5.

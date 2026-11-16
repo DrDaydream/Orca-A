@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import socket
 import struct
 import subprocess
@@ -25,6 +26,8 @@ def main():
     parser.add_argument('--duration', type=float, default=12)
     parser.add_argument('--nodes', type=int, default=4)
     parser.add_argument('--gc-depth', type=int, default=50)
+    parser.add_argument('--keys-from', type=Path,
+                        help='Reuse key-N.json files for comparisons; stores and ports remain fresh')
     parser.add_argument('--output', type=Path)
     args = parser.parse_args()
     if args.nodes < 4 or args.nodes > 200 or args.duration < 6 or args.gc_depth < 1:
@@ -47,7 +50,10 @@ def main():
     authorities, names = {}, []
     for node in range(args.nodes):
         key = root / f'key-{node}.json'
-        subprocess.run([str(binary), 'generate_keys', '--filename', str(key)], check=True, creationflags=flags)
+        if args.keys_from:
+            shutil.copyfile(args.keys_from / key.name, key)
+        else:
+            subprocess.run([str(binary), 'generate_keys', '--filename', str(key)], check=True, creationflags=flags)
         name = json.loads(key.read_text())['name']
         names.append(name)
         authorities[name] = {

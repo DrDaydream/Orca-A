@@ -143,3 +143,50 @@ and 292.5/341.0 ms respectively. These results demonstrate recovery of sustained
 output on this host. The old latency excludes nearly all post-stall requests,
 so comparing its mean directly to a full successful run is misleading. They
 do not establish an Ubuntu/WAN latency improvement.
+
+### Late, never-output history — 2026-11-17
+
+A further same-key late-join test exposed an additional GC case in 008ad5d:
+an observed round-1 vertex had never been output when its metadata was
+pruned. Final output stopped near round 52 while later leaders continued
+becoming rule-ready. The same behavior occurred with and without the
+independent Helper reuse experiment.
+
+GC now retains never-output Dag, VDag and observed metadata. It still prunes
+ordered history using the existing policy. Both causal traversal and final
+pending-sequence filtering use exact ordered-digest membership, matching
+Algorithm 5's deliveredVertices set. A newer output from an author does not
+imply that all older vertices from that author were output. Two regressions
+first failed under the old code and now assert actual old-ancestor output,
+prefix advancement and no duplicate output.
+
+This retains metadata already observed by this process. It does not add an
+archival recovery path for arbitrary never-observed old vertices or provide
+restart recovery. Never-output headers and associated dependency/transitive
+ancestor indexes can remain indefinitely; memory and GC scan cost are not
+bounded by gc_depth. This is a correctness tradeoff, not a bounded-memory
+claim. The exact ordered-digest ledger also still grows with total output.
+
+The final source passes 144 release workspace tests with one manual benchmark
+ignored, and its release node build succeeds. A same-key 12-second late-join
+smoke emits 709 identical headers across all four replicas, reaches round
+199 with no final round lag, and commits within 94 ms of shutdown. The same
+retention logic, before consolidating the identical Dag/VDag loops, also
+passed a 30-second late-join smoke at round 528 with 1,987 identical headers;
+ten-node and one-absent smokes passed with prefixes of 1,848 and 550 and no
+final round lag. The smoke runner accepts --keys-from to reproduce a leader
+schedule while allocating fresh ports and databases.
+
+The final executable's 20-second Windows loopback run uses the same parameters
+listed above and default threads. Its fixed-window final TPS is 49,529.95,
+final consensus/end-to-end means are 255.84/296.79 ms, and end-to-end p95 is
+497 ms. It completes 1,583 of 1,600 samples, reports no client rate warnings,
+and all replicas emit the same 1,040 headers, with new output within 205 ms
+of shutdown. This checks sustained output after the correctness fix; it is
+not a paired experiment establishing lower latency.
+
+The separate orca-a-repair-reuse-experiment reduces repeated reconstruction
+and serialization of adjacent complete-proposal repairs. It is not included
+here: its measured latency/throughput tradeoff remains inconclusive. Thread
+defaults, fabric parameters, quorum rules and the serial startup procedure
+remain unchanged.
