@@ -938,6 +938,45 @@ async fn completed_parent_round_advance_does_not_wait_for_storage() {
 }
 
 #[tokio::test]
+async fn stored_dependency_metadata_must_match_its_lookup_digest() {
+    for virtual_edge in [false, true] {
+        let mut h = Harness::new(&format!("dependency_key_{}", virtual_edge), 0);
+        let dependency = proposal();
+        let claimed_digest = Digest([111; 32]);
+        assert_ne!(claimed_digest, dependency.block().digest());
+        let mut child = proposal().header;
+        if virtual_edge {
+            child.virtual_edges.insert(claimed_digest.clone());
+            h.core
+                .store
+                .write(
+                    proposal_header_key(&claimed_digest),
+                    bincode::serialize(&dependency.header).unwrap(),
+                )
+                .await;
+        } else {
+            child.weak_edges.insert(claimed_digest.clone());
+            h.core
+                .store
+                .write(
+                    claimed_digest.to_vec(),
+                    bincode::serialize(&dependency.block()).unwrap(),
+                )
+                .await;
+        }
+        let result = h
+            .core
+            .synchronizer
+            .get_parents(&child, &h.core.grade_one_certificates, &h.core.completed)
+            .await;
+        assert!(
+            matches!(result, Err(DagError::MalformedHeader(_))),
+            "a wrong stored record must not borrow its lookup key's edge identity"
+        );
+    }
+}
+
+#[tokio::test]
 async fn ready_only_parent_still_blocks_echo_and_round_advance() {
     let (mut h, mut child) = completed_parent_fixture("cached_ready_only").await;
     let parent = Proposal {
@@ -1016,7 +1055,7 @@ async fn ready_only_parent_still_blocks_echo_and_round_advance() {
 #[tokio::test]
 #[ignore = "manual dependency-processing microbenchmark, not end-to-end TPS"]
 async fn benchmark_completed_dependency_processing() {
-    for references in [10, 11, 20] {
+    for references in [4, 10, 20, 30] {
         let mut h = Harness::new(&format!("dependency_bench_{}", references), 0);
         let mut child = proposal();
         child.header.round = 2;
@@ -1039,22 +1078,43 @@ async fn benchmark_completed_dependency_processing() {
         // Flush setup writes before starting the measurements.
         h.core.store.read(vec![]).await.unwrap();
         let block = child.block();
-        let iterations = 100 * references;
+        let iterations = 1000 * references;
         let start = Instant::now();
         for _ in 0..iterations {
-            assert_eq!(
-                h.core
-                    .synchronizer
-                    .get_parents(
-                        &child.header,
-                        &h.core.grade_one_certificates,
-                        &h.core.completed
-                    )
-                    .await
-                    .unwrap()
-                    .len(),
-                references
-            );
+            let parents = h
+                .core
+                .synchronizer
+                .get_parents(
+                    &child.header,
+                    &h.core.grade_one_certificates,
+                    &h.core.completed,
+                )
+                .await
+                .unwrap();
+            assert_eq!(parents.len(), references);
+            // Include the production consumer's three edge-class passes.
+            // Retrieval-only timing misses repeated certificate hashing.
+            let mut stake = 0;
+            for parent in parents
+                .iter()
+                .filter(|p| child.header.parents.contains(&p.digest))
+            {
+                assert_eq!(parent.round + 1, child.header.round);
+                stake += h.core.committee.stake(&parent.author);
+            }
+            for parent in parents
+                .iter()
+                .filter(|p| child.header.weak_edges.contains(&p.digest))
+            {
+                assert!(parent.round + 1 < child.header.round);
+            }
+            for parent in parents
+                .iter()
+                .filter(|p| child.header.virtual_edges.contains(&p.digest))
+            {
+                assert_eq!(parent.round + 1, child.header.round);
+            }
+            std::hint::black_box(stake);
             assert!(h
                 .core
                 .synchronizer

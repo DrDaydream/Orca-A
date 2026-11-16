@@ -1,5 +1,11 @@
 # Orca-A complete-proposal GRBC branch
 
+**Experimental branch notice:** `orca-a-dependency-metadata-experiment` tests
+compact dependency metadata. Its local CPU savings did not demonstrate a
+lower final-commit latency. The recommended GC-corrected branch remains
+`orca-a-grbc-echo-ready`. See
+`docs/experiments/dependency-metadata-2026-11-17.md` for all comparison results.
+
 This branch starts at Orca-A `54bd1f29fc03414a16da7044e5eb31df92e6212b` and ports the retained broadcast and benchmark changes from Orca-B `a309da2`. The protocol reference is the supplied Orca draft, Section II (GRBC), Section IV (Orca-A), and Algorithm 5 (ordered output). Orca-A keeps its Good, Deferred, and three `r mod 3` pessimistic recovery lanes. It has no ABA subsystem.
 
 ## Broadcast and storage

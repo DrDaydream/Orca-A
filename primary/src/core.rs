@@ -447,17 +447,17 @@ impl Core {
         let mut parent_authors = HashSet::new();
         for x in referenced
             .iter()
-            .filter(|x| header.parents.contains(&x.digest()))
+            .filter(|x| header.parents.contains(&x.digest))
         {
             ensure!(
-                x.round() + 1 == header.round,
+                x.round + 1 == header.round,
                 DagError::MalformedHeader(header.id.clone())
             );
             ensure!(
-                parent_authors.insert(x.origin()),
+                parent_authors.insert(x.author),
                 DagError::MalformedHeader(header.id.clone())
             );
-            stake += self.committee.stake(&x.origin());
+            stake += self.committee.stake(&x.author);
         }
         ensure!(
             stake >= self.quorum_threshold,
@@ -467,10 +467,10 @@ impl Core {
         // Weak edges must point strictly below the previous round.
         for x in referenced
             .iter()
-            .filter(|x| header.weak_edges.contains(&x.digest()))
+            .filter(|x| header.weak_edges.contains(&x.digest))
         {
             ensure!(
-                x.round() + 1 < header.round,
+                x.round + 1 < header.round,
                 DagError::MalformedHeader(header.id.clone())
             );
         }
@@ -479,10 +479,10 @@ impl Core {
         // the immediately preceding round.
         for x in referenced
             .iter()
-            .filter(|x| header.virtual_edges.contains(&x.digest()))
+            .filter(|x| header.virtual_edges.contains(&x.digest))
         {
             ensure!(
-                x.round() + 1 == header.round,
+                x.round + 1 == header.round,
                 DagError::MalformedHeader(header.id.clone())
             );
         }

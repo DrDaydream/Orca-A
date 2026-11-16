@@ -1,13 +1,42 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-use crate::error::DagResult;
+use crate::error::{DagError, DagResult};
 use crate::header_waiter::WaiterMessage;
 use crate::messages::{proposal_header_key, Certificate, Header};
+use crate::primary::Round;
 use config::Committee;
-use crypto::Digest;
 use crypto::Hash as _;
+use crypto::{Digest, PublicKey};
 use std::collections::{HashMap, HashSet};
 use store::Store;
 use tokio::sync::mpsc::Sender;
+
+/// Immutable fields used by Core's edge checks. The lookup key already binds
+/// cached records, so returning dependencies need not clone their full headers.
+pub struct ParentMetadata {
+    pub digest: Digest,
+    pub round: Round,
+    pub author: PublicKey,
+}
+
+impl ParentMetadata {
+    fn new(digest: &Digest, header: &Header) -> Self {
+        Self {
+            digest: digest.clone(),
+            round: header.round,
+            author: header.author,
+        }
+    }
+
+    fn from_stored(digest: &Digest, parent: Certificate) -> DagResult<Self> {
+        // Storage fallback is decoded once. Check the content-addressed key
+        // here instead of repeatedly hashing the returned record in Core.
+        ensure!(
+            parent.digest() == *digest,
+            DagError::MalformedHeader(parent.header.id)
+        );
+        Ok(Self::new(digest, &parent.header))
+    }
+}
 
 /// Checks proposal dependencies and requests missing records through HeaderWaiter.
 pub struct Synchronizer {
@@ -43,10 +72,12 @@ impl Synchronizer {
         header: &Header,
         ready: &HashMap<Digest, Certificate>,
         completed: &HashSet<Digest>,
-    ) -> DagResult<Vec<Certificate>> {
+    ) -> DagResult<Vec<ParentMetadata>> {
         let mut missing_required = Vec::new();
         let mut missing_virtual = Vec::new();
-        let mut parents = Vec::new();
+        let mut parents = Vec::with_capacity(
+            header.parents.len() + header.weak_edges.len() + header.virtual_edges.len(),
+        );
         for digest in header.parents.iter().chain(&header.weak_edges) {
             // READY metadata alone cannot satisfy a strong/weak dependency.
             // Reuse Core's immutable record only after local completion.
@@ -54,7 +85,7 @@ impl Synchronizer {
                 .get(digest)
                 .filter(|c| completed.contains(&c.header.id))
             {
-                parents.push(parent.clone());
+                parents.push(ParentMetadata::new(digest, &parent.header));
                 continue;
             }
             if let Some(genesis) = self
@@ -63,18 +94,21 @@ impl Synchronizer {
                 .find(|(x, _)| x == digest)
                 .map(|(_, x)| x)
             {
-                parents.push(genesis.clone());
+                parents.push(ParentMetadata::new(digest, &genesis.header));
                 continue;
             }
 
             match self.store.read(digest.to_vec()).await? {
-                Some(certificate) => parents.push(bincode::deserialize(&certificate)?),
+                Some(certificate) => parents.push(ParentMetadata::from_stored(
+                    digest,
+                    bincode::deserialize(&certificate)?,
+                )?),
                 None => missing_required.push(digest.clone()),
             };
         }
         for digest in &header.virtual_edges {
             if let Some(parent) = ready.get(digest) {
-                parents.push(parent.clone());
+                parents.push(ParentMetadata::new(digest, &parent.header));
                 continue;
             }
             if let Some((_, genesis)) = self
@@ -82,17 +116,20 @@ impl Synchronizer {
                 .iter()
                 .find(|(candidate, _)| candidate == digest)
             {
-                parents.push(genesis.clone());
+                parents.push(ParentMetadata::new(digest, &genesis.header));
                 continue;
             }
             // Validate the target's signed metadata, not its local grade. One
             // honest node reaching READY does not imply every peer can reach
             // READY, so requiring a local grade here would block honest proposals.
             match self.store.read(proposal_header_key(digest)).await? {
-                Some(bytes) => parents.push(Certificate {
-                    header: bincode::deserialize(&bytes)?,
-                    votes: Vec::new(),
-                }),
+                Some(bytes) => parents.push(ParentMetadata::from_stored(
+                    digest,
+                    Certificate {
+                        header: bincode::deserialize(&bytes)?,
+                        votes: Vec::new(),
+                    },
+                )?),
                 None => missing_virtual.push(digest.clone()),
             }
         }
