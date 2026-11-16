@@ -682,10 +682,17 @@ impl Core {
     }
 
     async fn try_advance_completed(&mut self, certificate: Certificate) -> DagResult<()> {
-        if !self
-            .synchronizer
-            .ready_for_round_advance(&certificate, &self.grade_one_certificates, &self.completed)
-            .await?
+        // Validation already proved strong/weak completion for this immutable
+        // header. Only commit feedback can complete it without that validation.
+        if !self.validated.contains(&certificate.header.id)
+            && !self
+                .synchronizer
+                .ready_for_round_advance(
+                    &certificate,
+                    &self.grade_one_certificates,
+                    &self.completed,
+                )
+                .await?
         {
             self.round_advance_pending
                 .insert(certificate.digest(), certificate);

@@ -938,6 +938,128 @@ async fn completed_parent_round_advance_does_not_wait_for_storage() {
 }
 
 #[tokio::test]
+async fn validated_finish_reuses_dependencies_after_parent_metadata_gc() {
+    let (mut h, child) = completed_parent_fixture("validated_finish_gc").await;
+    h.core.process_proposal(child.clone()).await.unwrap();
+    for vote in votes(&child.header, GrbcPhase::Echo)
+        .into_iter()
+        .skip(1)
+        .take(2)
+    {
+        h.core.process_grbc_vote(vote).await.unwrap();
+    }
+    assert_eq!(h.grades(), vec![1]);
+    let ready = votes(&child.header, GrbcPhase::Ready);
+    h.core.process_grbc_vote(ready[1].clone()).await.unwrap();
+    h.core
+        .consensus_round
+        .store(h.core.gc_depth + child.header.round, Ordering::Relaxed);
+    h.core.cleanup();
+    assert!(h.core.validated.contains(&child.header.id));
+    assert!(child
+        .header
+        .parents
+        .iter()
+        .all(|digest| !h.core.grade_one_certificates.contains_key(digest)));
+
+    // Only dependency reads use this busy store. The genuine completion write
+    // still goes to the original store. FINISH must use the earlier validation
+    // even though the parent's in-memory metadata has been garbage collected.
+    let (store_tx, mut store_rx) = channel(8);
+    h.core.synchronizer =
+        Synchronizer::new(&committee(), Store::from_channel(store_tx), channel(8).0);
+    tokio::task::yield_now().await;
+    h.core
+        .process_grbc_vote(ready[2].clone())
+        .now_or_never()
+        .expect("Validated FINISH must not reread its parents from storage")
+        .unwrap();
+    assert!(store_rx.try_recv().is_err());
+    assert_eq!(h.grades(), vec![2]);
+    assert!(h.core.completed.contains(&child.header.id));
+    assert!(h.core.round_advance_pending.is_empty());
+    assert!(h.core.certificates_aggregators.contains_key(&2));
+}
+
+#[tokio::test]
+async fn unvalidated_commit_waits_for_strong_and_weak_completion_before_advancing() {
+    let mut h = Harness::new("unvalidated_advance_dependencies", 0);
+    let first_round = crate::common::headers();
+    let weak = Certificate {
+        header: first_round[3].clone(),
+        votes: Vec::new(),
+    };
+    let first_round_digests: std::collections::BTreeSet<_> = first_round
+        .into_iter()
+        .map(|header| {
+            Certificate {
+                header,
+                votes: Vec::new(),
+            }
+            .digest()
+        })
+        .collect();
+    let parents: Vec<_> = keys()
+        .into_iter()
+        .take(3)
+        .map(|(author, secret)| {
+            let mut header = Header {
+                author,
+                round: 2,
+                parents: first_round_digests.clone(),
+                ..Header::default()
+            };
+            header.id = header.digest();
+            header.signature = Signature::new(&header.id, &secret);
+            Certificate {
+                header,
+                votes: Vec::new(),
+            }
+        })
+        .collect();
+    let mut child = proposal();
+    child.header.round = 3;
+    child.header.parents = parents.iter().map(Certificate::digest).collect();
+    child.header.weak_edges.insert(weak.digest());
+    resign(&mut child);
+    h.core.process_proposal(child.clone()).await.unwrap();
+    assert!(!h.core.validated.contains(&child.header.id));
+    // READY-only metadata cannot replace strong/weak completion, even after
+    // consensus has committed the child itself.
+    for parent in parents.iter().chain(std::iter::once(&weak)) {
+        h.core
+            .grade_one_certificates
+            .insert(parent.digest(), parent.clone());
+    }
+    h.core.process_committed(vec![child.block()]).await.unwrap();
+    assert!(h.core.completed.contains(&child.header.id));
+    assert!(h
+        .core
+        .round_advance_pending
+        .contains_key(&child.block().digest()));
+    assert!(!h.core.certificates_aggregators.contains_key(&3));
+    for parent in &parents {
+        h.core.record_completed(parent).await.unwrap();
+    }
+    h.core.retry_round_advance_pending().await.unwrap();
+    assert!(h
+        .core
+        .round_advance_pending
+        .contains_key(&child.block().digest()));
+    assert!(!h.core.certificates_aggregators.contains_key(&3));
+    h.core.record_completed(&weak).await.unwrap();
+    h.core.retry_round_advance_pending().await.unwrap();
+    assert!(h.core.round_advance_pending.is_empty());
+    assert!(h.core.certificates_aggregators.contains_key(&3));
+    assert!(!h.core.validated.contains(&child.header.id));
+    assert!(
+        h.grades().is_empty(),
+        "Commit feedback must not fabricate a GRBC grade"
+    );
+    assert!(h.outgoing().is_empty());
+}
+
+#[tokio::test]
 async fn ready_only_parent_still_blocks_echo_and_round_advance() {
     let (mut h, mut child) = completed_parent_fixture("cached_ready_only").await;
     let parent = Proposal {
