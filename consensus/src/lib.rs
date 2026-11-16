@@ -50,6 +50,8 @@ struct FallbackDecision {
 
 /// The state that needs to be persisted for crash-recovery.
 struct State {
+    /// Largest consecutive leader prefix already released (including skips).
+    finalized_round: Round,
     /// The last committed round.
     last_committed_round: Round,
     // Keeps the last committed round for each authority. This map is used to clean up the dag and
@@ -180,6 +182,7 @@ impl State {
             .collect();
 
         Self {
+            finalized_round: 0,
             last_committed_round: 0,
             last_committed: genesis_dag
                 .get(&0)
@@ -498,10 +501,10 @@ impl State {
                 .iter()
                 .chain(&certificate.header.weak_edges)
             {
-                // Dag membership is digest-idempotent. Shared strong/weak
-                // ancestors commonly occur in several commit-ready histories;
-                // never enqueue or insert an ancestor that is already present.
-                if self.dag_digests.contains(dependency) {
+                // With complete history, shared Dag ancestors need no repeat
+                // traversal. While a force-admission gap remains, traverse
+                // them so this owner also waits for any shared missing history.
+                if self.dag_digests.contains(dependency) && self.forced_history_waiters.is_empty() {
                     continue;
                 } else if let Some(ancestor) = self.observed.get(dependency).cloned() {
                     pending.push(ancestor);
@@ -675,9 +678,7 @@ impl State {
     }
 
     fn predecessor_resolved(&self, round: Round) -> bool {
-        round > 0
-            && (self.committed_leaders.contains(&(round - 1))
-                || self.skipped_leaders.contains(&(round - 1)))
+        round > 0 && self.finalized_round == round - 1
     }
 
     fn wake_pending(&mut self, round: Round) {
@@ -1229,9 +1230,10 @@ impl Consensus {
         let leader_digest = leader.digest();
 
         let (observed_stake, dag_stake) = self.strong_support_stake(r, &leader_digest, state);
-        if observed_stake < self.committee.quorum_threshold()
-            && dag_stake < self.committee.validity_threshold()
-        {
+        let good_observed = state.dag_digests.contains(&leader_digest)
+            && observed_stake >= self.committee.quorum_threshold();
+        let good_accepted = dag_stake >= self.committee.validity_threshold();
+        if !good_observed && !good_accepted {
             return;
         }
 
@@ -1242,9 +1244,8 @@ impl Consensus {
             observed_stake,
             dag_stake
         );
-        // Rule 1 accepts the leader from any verified GRBC stage. Once the
-        // quorum condition succeeds, recover it and its causal history into Dag.
-        state.force_observed_history_to_dag(leader.clone(), leader_round);
+        // Accepted votes may recover a leader from any verified GRBC stage.
+        // The larger observed-only quorum requires the leader already in Dag.
         self.queue_leader_commit(leader, 1, state).await;
     }
 
@@ -1265,19 +1266,7 @@ impl Consensus {
             return;
         }
 
-        let leader_authority = self.ordering_leader_authority(leader_round);
-        let leader = state
-            .dag
-            .get(&leader_round)
-            .and_then(|round| round.get(&leader_authority))
-            .or_else(|| {
-                state
-                    .vdag
-                    .get(&leader_round)
-                    .and_then(|round| round.get(&leader_authority))
-            })
-            .map(|(_, certificate)| certificate.clone());
-        let leader = match leader {
+        let leader = match self.observed_leader(leader_round, state) {
             Some(leader) => leader,
             None => return,
         };
@@ -1292,19 +1281,8 @@ impl Consensus {
             return;
         }
 
-        if condition_three && !state.grade_two.contains(&leader_digest) {
-            sampled_debug!(
-                leader_round,
-                "Commit rule 2 forces grade 2 for {:?}",
-                leader
-            );
-            state.mark_grade_two(leader_digest.clone());
-            state.promote_ready();
-        }
-
-        // Conditions 1 and 2 normally operate on a grade-2 Leader already in
-        // Dag. Condition 3 may promote it immediately above. If dependencies
-        // still prevent promotion, the ordered pending queue retains it.
+        // GDP force-acceptance recovers the leader and its causal ancestors.
+        // It does not manufacture a local GRBC FINISH delivery.
         sampled_debug!(leader_round,
             "Leader {:?} satisfies commit rule 2: observed-strong {}, Dag-strong {}, Dag-strong-or-virtual {}",
             leader, observed_strong, dag_strong, dag_strong_or_virtual
@@ -1325,50 +1303,18 @@ impl Consensus {
             .get(&(q, leader_digest.clone()))
             .unwrap_or(&empty);
         let mut dag_strong_or_virtual = HashSet::new();
-        let blocks: Vec<_> = state
+        let blocks = state
             .dag
             .get(&q)
             .into_iter()
             .flat_map(|round| round.values())
-            .map(|(_, block)| block)
-            .collect();
-        // At larger committee sizes, independent virtual-path checks are CPU
-        // bound. Compute them in parallel over immutable state; merge results
-        // back into the ordered consensus state on this thread.
-        if blocks.len() >= 8 {
-            let workers = std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1)
-                .min(blocks.len());
-            let chunk_size = (blocks.len() + workers - 1) / workers;
-            std::thread::scope(|scope| {
-                let mut handles = Vec::new();
-                for chunk in blocks.chunks(chunk_size) {
-                    handles.push(scope.spawn(move || {
-                        chunk
-                            .iter()
-                            .filter_map(|block| {
-                                let origin = block.origin();
-                                (dag_strong.contains(&origin)
-                                    || self.has_two_hop_virtual_path(block, leader_digest, state))
-                                .then_some(origin)
-                            })
-                            .collect::<Vec<_>>()
-                    }));
-                }
-                for handle in handles {
-                    dag_strong_or_virtual
-                        .extend(handle.join().expect("Virtual-path worker panicked"));
-                }
-            });
-        } else {
-            for block in blocks {
-                let origin = block.origin();
-                if dag_strong.contains(&origin)
-                    || self.has_two_hop_virtual_path(block, leader_digest, state)
-                {
-                    dag_strong_or_virtual.insert(origin);
-                }
+            .map(|(_, block)| block);
+        for block in blocks {
+            let origin = block.origin();
+            if dag_strong.contains(&origin)
+                || self.has_two_hop_virtual_path(block, leader_digest, state)
+            {
+                dag_strong_or_virtual.insert(origin);
             }
         }
 
@@ -1730,6 +1676,9 @@ impl Consensus {
     /// Retry only leaders and fallback anchors whose indexed evidence changed.
     async fn process_dirty_leaders(&mut self, state: &mut State) {
         loop {
+            // Forced causal-history admission can unblock FINISH-delivered
+            // descendants even when the triggering message is only Observed.
+            state.promote_ready();
             let dirty: Vec<_> = state.dirty_leaders.drain().collect();
             for leader_round in dirty {
                 if !state.committed_leaders.contains(&leader_round)
@@ -1742,10 +1691,14 @@ impl Consensus {
                 }
             }
             self.evaluate_dirty_fallback_anchors(state).await;
-            if state.dirty_leaders.is_empty() && state.dirty_fallback_anchors.is_empty() {
+            if state.dirty_leaders.is_empty()
+                && state.dirty_fallback_anchors.is_empty()
+                && state.promotion_queue.is_empty()
+            {
                 break;
             }
         }
+        self.drain_ready_leaders(state).await;
     }
 
     fn observed_leader(&self, round: Round, state: &State) -> Option<Certificate> {
@@ -1839,8 +1792,7 @@ impl Consensus {
 
     fn log_pending_blockers(&self, state: &State) {
         for (round, leader) in &state.pending_leaders {
-            let predecessor_ready = state.committed_leaders.contains(&(round - 1))
-                || state.skipped_leaders.contains(&(round - 1));
+            let predecessor_ready = state.predecessor_resolved(*round);
             let in_dag = state.dag_digests.contains(&leader.digest());
             if !predecessor_ready || !in_dag {
                 sampled_debug!(*round,
@@ -1860,6 +1812,7 @@ impl Consensus {
             if let Some(leader) = state.pending_leaders.get(round).cloned() {
                 let ordered = self.order_dag(&leader, state);
                 state.pending_order.insert(*round, ordered);
+                state.wake_pending(*round);
             }
         }
     }
@@ -1898,6 +1851,12 @@ impl Consensus {
 
     async fn drain_ready_leaders(&mut self, state: &mut State) {
         loop {
+            // A resolved successor cannot bypass an earlier undecided leader.
+            // Skips advance only after every earlier round has been released.
+            while state.skipped_leaders.contains(&(state.finalized_round + 1)) {
+                state.finalized_round += 1;
+                state.wake_pending(state.finalized_round + 1);
+            }
             let ready_round = match state.ready_pending.iter().next().cloned() {
                 Some(round) => {
                     state.ready_pending.remove(&round);
@@ -1912,6 +1871,10 @@ impl Consensus {
                 .map_or(false, |leader| {
                     state.predecessor_resolved(ready_round)
                         && state.dag_digests.contains(&leader.digest())
+                        && !state
+                            .forced_history_waiters
+                            .values()
+                            .any(|owners| owners.contains(&ready_round))
                 });
             if !leader_ready {
                 continue;
@@ -1922,6 +1885,7 @@ impl Consensus {
             if !state.committed_leaders.insert(ready_round) {
                 continue;
             }
+            state.finalized_round = ready_round;
             state.wake_pending(ready_round + 1);
 
             let mut sequence = state
@@ -1937,12 +1901,12 @@ impl Consensus {
                     .get(&certificate.origin())
                     .map_or(true, |round| certificate.round() > *round)
             });
-            let commit_rule = state.leader_commit_rules.remove(&ready_round).unwrap_or(3);
+            let _commit_rule = state.leader_commit_rules.remove(&ready_round).unwrap_or(3);
             #[cfg(feature = "benchmark")]
             info!(
                 "Commit rule stats leader {:?} rule {} outcome commit blocks {}",
                 leader.header.digest(),
-                commit_rule,
+                _commit_rule,
                 sequence.len()
             );
             let _rule_ready_at_ms =
@@ -1955,6 +1919,10 @@ impl Consensus {
                             .expect("System clock is before Unix epoch")
                             .as_millis()
                     });
+            let _committed_at_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("System clock is before Unix epoch")
+                .as_millis();
             state.update(&sequence, self.gc_depth);
             for certificate in &sequence {
                 #[cfg(not(feature = "benchmark"))]
@@ -1969,8 +1937,8 @@ impl Consensus {
                 #[cfg(feature = "benchmark")]
                 for digest in certificate.header.payload.keys() {
                     info!(
-                        "Committed {} -> {:?} @ {}",
-                        certificate.header, digest, _rule_ready_at_ms
+                        "Committed {} -> {:?} @ {} commit {}",
+                        certificate.header, digest, _rule_ready_at_ms, _committed_at_ms
                     );
                 }
             }
@@ -2153,8 +2121,9 @@ impl Consensus {
         // Ensure we do not commit garbage collected certificates.
         ordered.retain(|x| x.round() + self.gc_depth >= state.last_committed_round);
 
-        // Ordering the output by round is not really necessary but it makes the commit sequence prettier.
-        ordered.sort_by_key(|x| x.round());
+        // All causal edges point to lower rounds. Round order is topological;
+        // break same-round ties by proposer as specified by Algorithm 5.
+        ordered.sort_by_key(|x| (x.round(), x.origin()));
         ordered
     }
 }

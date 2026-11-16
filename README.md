@@ -1,5 +1,7 @@
 # Orca-A
 
+The `orca-a-grbc-echo-ready` branch implements complete-proposal GRBC and preserves Orca-A's GDP recovery. See [the branch's protocol, measurement and Ubuntu guide](README-GRBC.md) for the updated flow and reproducible commands. Historical performance examples below predate this branch.
+
 [![Rust](https://anonymous.4open.science/r/Orca-A-4DC3/actions/workflows/rust.yml/badge.svg)](https://anonymous.4open.science/r/Orca-A-4DC3/actions/workflows/rust.yml)
 [![Ubuntu](https://img.shields.io/badge/Ubuntu-24.04-E95420?style=flat-square&logo=ubuntu)](https://ubuntu.com/)
 [![license](https://img.shields.io/badge/license-Apache--2.0-blue.svg?style=flat-square)](LICENSE)
@@ -15,7 +17,7 @@ The protocol is implemented in Rust. Benchmark orchestration and result parsing 
 The following commands target Ubuntu 24.04 and install dependencies directly into the current user environment:
 
 ~~~bash
-git clone https://github.com/DrDaydream/Orca-A.git
+git clone --branch orca-a-grbc-echo-ready --single-branch https://github.com/DrDaydream/Orca-A.git
 cd Orca-A
 
 sudo apt-get update
@@ -211,7 +213,7 @@ For comparison, this is the previously recorded 4-node, 1-fault, 20-second local
 -----------------------------------------
 ~~~
 
-`Consensus latency` measures header creation to consensus commit. `End-to-end latency` begins when the benchmark client submits a sampled transaction. The additional leader, rule-order, and Rule 1/2/3 fields are Orca-A-specific statistics produced after the run.
+The legacy SUMMARY's `Consensus latency` ends at the carrying leader's rule-ready time; `End-to-end latency` uses the same endpoint, starting at a sampled client transaction. Use `FINAL ORDERED COMPARISON` and `logs/comparison.json` for final ordered commits over the fixed benchmark window. See [metric definitions](README-GRBC.md#measurement-and-validation). The additional leader, rule-order, and Rule 1/2/3 fields are Orca-A-specific statistics.
 
 
 ## License

@@ -371,6 +371,48 @@ fn order_dag_includes_parents_and_weak_but_excludes_virtual_history() {
 }
 
 #[test]
+fn order_dag_breaks_same_round_ties_by_author_instead_of_digest_traversal() {
+    let committee = mock_committee();
+    let consensus = Consensus {
+        committee: committee.clone(),
+        gc_depth: 50,
+        rx_primary: channel(1).1,
+        tx_primary: channel(1).0,
+        tx_output: OutputSender::Individual(channel(1).0),
+        genesis: Certificate::genesis(&committee),
+    };
+    let mut state = State::new(Certificate::genesis(&committee));
+    let mut authorities: Vec<_> = keys().into_iter().map(|(key, _)| key).collect();
+    authorities.sort();
+    let mut parents = BTreeSet::new();
+    let mut ancestors = Vec::new();
+    for authority in &authorities {
+        let (digest, ancestor) = mock_certificate(*authority, 1, BTreeSet::new());
+        parents.insert(digest.clone());
+        ancestors.push((digest, ancestor.clone()));
+        state.promote_to_dag(ancestor);
+    }
+    // DFS visits these BTreeSet parents in reverse digest order. The seeded
+    // fixture deliberately makes that differ from the paper's author tie break.
+    ancestors.sort_by(|left, right| right.0.cmp(&left.0));
+    let digest_order: Vec<_> = ancestors.iter().map(|(_, block)| block.origin()).collect();
+    assert_ne!(digest_order, authorities);
+    let (_, leader) = mock_certificate(authorities[0], 2, parents);
+    let ordered = consensus.order_dag(&leader, &state);
+
+    let expected: Vec<_> = authorities
+        .iter()
+        .map(|author| (1, *author))
+        .chain(std::iter::once((2, authorities[0])))
+        .collect();
+    let actual: Vec<_> = ordered
+        .iter()
+        .map(|block| (block.round(), block.origin()))
+        .collect();
+    assert_eq!(actual, expected);
+}
+
+#[test]
 fn designates_one_leader_every_round() {
     let committee = mock_committee();
     let consensus = Consensus {
@@ -488,7 +530,7 @@ fn rule_one_does_not_count_locally_present_unreferenced_leader() {
 }
 
 #[tokio::test]
-async fn rule_one_promotes_observed_leader_and_causal_history_to_dag() {
+async fn rule_one_accepted_votes_promote_observed_leader_and_causal_history_to_dag() {
     let committee = mock_committee();
     let (tx_output, _rx_output) = channel(20);
     let (tx_primary, _rx_primary) = channel(20);
@@ -511,8 +553,10 @@ async fn rule_one_promotes_observed_leader_and_causal_history_to_dag() {
     state.observe(leader);
 
     let support_parents: BTreeSet<_> = [leader_digest.clone()].iter().cloned().collect();
-    for authority in authorities.iter().take(3) {
-        state.observe(mock_certificate(*authority, 2, support_parents.clone()).1);
+    for authority in authorities.iter().take(2) {
+        let block = mock_certificate(*authority, 2, support_parents.clone()).1;
+        state.observe(block.clone());
+        state.promote_to_dag(block);
     }
 
     consensus.evaluate_commit_rule_one(2, &mut state).await;
@@ -1102,7 +1146,7 @@ async fn fallback_requests_only_the_newest_missing_stack_entry() {
 }
 
 #[tokio::test]
-async fn commit_rule_two_condition_three_forces_leader_grade_two() {
+async fn commit_rule_two_virtual_votes_force_accept_without_fabricating_finish() {
     let committee = mock_committee();
     let (tx_primary, _rx_primary) = channel(100);
     let (tx_output, _rx_output) = channel(100);
@@ -1131,7 +1175,7 @@ async fn commit_rule_two_condition_three_forces_leader_grade_two() {
 
     assert!(!state.grade_two.contains(&leader_digest));
     consensus.evaluate_commit_rule_two(3, &mut state).await;
-    assert!(state.grade_two.contains(&leader_digest));
+    assert!(!state.grade_two.contains(&leader_digest));
     assert!(state.dag_digests.contains(&leader_digest));
     assert!(state.committed_leaders.contains(&1));
 }
@@ -1168,6 +1212,226 @@ async fn leader_commits_wait_for_the_previous_leader() {
     assert!(state.committed_leaders.contains(&1));
     assert!(state.committed_leaders.contains(&2));
     assert!(state.pending_leaders.is_empty());
+}
+
+#[tokio::test]
+async fn good_observed_quorum_waits_for_leader_acceptance() {
+    let committee = mock_committee();
+    let (tx_primary, _rx_primary) = channel(100);
+    let (tx_output, mut rx_output) = channel(100);
+    let mut consensus = Consensus {
+        committee: committee.clone(),
+        gc_depth: 50,
+        rx_primary: channel(1).1,
+        tx_primary,
+        tx_output: OutputSender::Individual(tx_output),
+        genesis: Certificate::genesis(&committee),
+    };
+    let mut state = State::new(Certificate::genesis(&committee));
+    let mut authorities: Vec<_> = keys().into_iter().map(|(key, _)| key).collect();
+    authorities.sort();
+    let (leader_digest, leader) = mock_certificate(authorities[0], 1, BTreeSet::new());
+    state.insert_grade_one(leader.clone());
+    for authority in authorities.iter().take(3) {
+        state.observe(
+            mock_certificate(
+                *authority,
+                2,
+                [leader_digest.clone()].iter().cloned().collect(),
+            )
+            .1,
+        );
+    }
+
+    consensus.evaluate_commit_rule_one(2, &mut state).await;
+    assert!(!state.committed_leaders.contains(&1));
+    assert!(!state.pending_leaders.contains_key(&1));
+    assert!(rx_output.try_recv().is_err());
+
+    state.mark_grade_two(leader_digest);
+    state.promote_ready();
+    // The ingestion loop dirties the designated leader on its FINISH event.
+    state.dirty_leaders.insert(1);
+    consensus.process_dirty_leaders(&mut state).await;
+    assert!(state.committed_leaders.contains(&1));
+    assert_eq!(rx_output.try_recv().unwrap(), leader);
+}
+
+#[tokio::test]
+async fn deferred_strong_votes_commit_observed_only_leader_on_late_middle_arrival() {
+    let committee = mock_committee();
+    let (tx_primary, _rx_primary) = channel(100);
+    let (tx_output, mut rx_output) = channel(100);
+    let mut consensus = Consensus {
+        committee: committee.clone(),
+        gc_depth: 50,
+        rx_primary: channel(1).1,
+        tx_primary,
+        tx_output: OutputSender::Individual(tx_output),
+        genesis: Certificate::genesis(&committee),
+    };
+    let mut state = State::new(Certificate::genesis(&committee));
+    let mut authorities: Vec<_> = keys().into_iter().map(|(key, _)| key).collect();
+    authorities.sort();
+    let (leader_digest, leader) = mock_certificate(authorities[0], 1, BTreeSet::new());
+    state.observe(leader.clone());
+    let (middle_digest, middle) = mock_certificate(
+        authorities[1],
+        2,
+        [leader_digest.clone()].iter().cloned().collect(),
+    );
+    for authority in authorities.iter().take(3) {
+        state.observe(
+            mock_certificate(
+                *authority,
+                3,
+                [middle_digest.clone()].iter().cloned().collect(),
+            )
+            .1,
+        );
+    }
+    consensus.evaluate_commit_rule_two(3, &mut state).await;
+    assert!(!state.committed_leaders.contains(&1));
+
+    let dirty = state.observe(middle);
+    state.dirty_leaders.extend(dirty);
+    consensus.process_dirty_leaders(&mut state).await;
+    assert!(state.committed_leaders.contains(&1));
+    assert!(!state.grade_two.contains(&leader_digest));
+    assert_eq!(rx_output.try_recv().unwrap(), leader);
+}
+
+#[tokio::test]
+async fn skipped_successor_does_not_release_past_undecided_prefix() {
+    let committee = mock_committee();
+    let (tx_primary, _rx_primary) = channel(100);
+    let (tx_output, mut rx_output) = channel(100);
+    let mut consensus = Consensus {
+        committee: committee.clone(),
+        gc_depth: 50,
+        rx_primary: channel(1).1,
+        tx_primary,
+        tx_output: OutputSender::Individual(tx_output),
+        genesis: Certificate::genesis(&committee),
+    };
+    let mut state = State::new(Certificate::genesis(&committee));
+    let authority = consensus.ordering_leader_authority(1);
+    let (_, leader_one) = mock_certificate(authority, 1, BTreeSet::new());
+    let (_, leader_three) = mock_certificate(authority, 3, BTreeSet::new());
+    consensus
+        .queue_leader_commit(leader_three.clone(), 3, &mut state)
+        .await;
+    consensus.mark_rule_three_skipped(2, &mut state);
+    consensus.drain_ready_leaders(&mut state).await;
+    assert!(!state.committed_leaders.contains(&3));
+    assert!(rx_output.try_recv().is_err());
+
+    consensus
+        .queue_leader_commit(leader_one.clone(), 3, &mut state)
+        .await;
+    assert!(state.committed_leaders.contains(&1));
+    assert!(state.committed_leaders.contains(&3));
+    assert_eq!(rx_output.try_recv().unwrap(), leader_one);
+    assert_eq!(rx_output.try_recv().unwrap(), leader_three);
+}
+
+#[tokio::test]
+async fn pending_commit_waits_for_late_causal_history_then_releases_immediately() {
+    let committee = mock_committee();
+    let (tx_primary, mut rx_primary) = channel(100);
+    let (tx_output, mut rx_output) = channel(100);
+    let mut consensus = Consensus {
+        committee: committee.clone(),
+        gc_depth: 50,
+        rx_primary: channel(1).1,
+        tx_primary,
+        tx_output: OutputSender::Individual(tx_output),
+        genesis: Certificate::genesis(&committee),
+    };
+    let mut state = State::new(Certificate::genesis(&committee));
+    let authority = consensus.ordering_leader_authority(2);
+    let (ancestor_digest, ancestor) = mock_certificate(authority, 1, BTreeSet::new());
+    let (_, mut leader) = mock_certificate(authority, 2, BTreeSet::new());
+    leader.header.weak_edges.insert(ancestor_digest.clone());
+    consensus.mark_rule_three_skipped(1, &mut state);
+    consensus
+        .queue_leader_commit(leader.clone(), 3, &mut state)
+        .await;
+    assert!(!state.committed_leaders.contains(&2));
+    assert!(rx_output.try_recv().is_err());
+    assert!(rx_primary.try_recv().is_err());
+
+    let dirty = state.observe(ancestor.clone());
+    consensus.refresh_pending_orders(&dirty, &mut state);
+    state.dirty_leaders.extend(dirty);
+    consensus.process_dirty_leaders(&mut state).await;
+    assert!(state.committed_leaders.contains(&2));
+    assert_eq!(rx_output.try_recv().unwrap(), ancestor);
+    assert_eq!(rx_output.try_recv().unwrap(), leader);
+    assert!(matches!(
+        rx_primary.try_recv(),
+        Ok(ConsensusCommand::Cleanup(_))
+    ));
+    assert!(matches!(
+        rx_primary.try_recv(),
+        Ok(ConsensusCommand::Cleanup(_))
+    ));
+}
+
+#[tokio::test]
+async fn shared_force_admitted_history_keeps_each_pending_leader_waiting() {
+    let committee = mock_committee();
+    let (tx_primary, _rx_primary) = channel(100);
+    let (tx_output, mut rx_output) = channel(100);
+    let mut consensus = Consensus {
+        committee: committee.clone(),
+        gc_depth: 50,
+        rx_primary: channel(1).1,
+        tx_primary,
+        tx_output: OutputSender::Individual(tx_output),
+        genesis: Certificate::genesis(&committee),
+    };
+    let mut state = State::new(Certificate::genesis(&committee));
+    let mut authorities: Vec<_> = keys().into_iter().map(|(key, _)| key).collect();
+    authorities.sort();
+    let (ancestor_digest, ancestor) = mock_certificate(authorities[2], 1, BTreeSet::new());
+    let (shared_digest, shared) = mock_certificate(
+        authorities[1],
+        2,
+        [ancestor_digest].iter().cloned().collect(),
+    );
+    state.observe(shared);
+    let (_, leader_four) = mock_certificate(
+        authorities[0],
+        4,
+        [shared_digest.clone()].iter().cloned().collect(),
+    );
+    consensus
+        .queue_leader_commit(leader_four.clone(), 3, &mut state)
+        .await;
+    assert!(state.dag_digests.contains(&shared_digest));
+
+    consensus.mark_rule_three_skipped(1, &mut state);
+    consensus.mark_rule_three_skipped(2, &mut state);
+    let (_, leader_three) = mock_certificate(
+        authorities[0],
+        3,
+        [shared_digest.clone()].iter().cloned().collect(),
+    );
+    consensus
+        .queue_leader_commit(leader_three.clone(), 3, &mut state)
+        .await;
+    assert!(!state.committed_leaders.contains(&3));
+    assert!(rx_output.try_recv().is_err());
+
+    let dirty = state.observe(ancestor.clone());
+    consensus.refresh_pending_orders(&dirty, &mut state);
+    state.dirty_leaders.extend(dirty);
+    consensus.process_dirty_leaders(&mut state).await;
+    assert_eq!(rx_output.try_recv().unwrap(), ancestor);
+    assert_eq!(rx_output.try_recv().unwrap().digest(), shared_digest);
+    assert_eq!(rx_output.try_recv().unwrap(), leader_three);
+    assert_eq!(rx_output.try_recv().unwrap(), leader_four);
 }
 
 // Run for 4 dag rounds in ideal conditions (all nodes reference all other nodes). We should commit
@@ -1359,10 +1623,11 @@ async fn not_enough_support() {
     assert_eq!(certificate.round(), 4);
 }
 
-// Rule 3 must request a missing early leader rather than treating absence as
-// evidence that it can be skipped.
+// Complete anchor histories without a vote for the missing leaders allow Rule 3
+// to skip them. Missing-leader retrieval is required only by a positive recovery
+// decision or by incomplete causal/virtual evidence (covered above).
 #[tokio::test]
-async fn missing_leader() {
+async fn missing_leaders_with_complete_vote_free_history_do_not_block_output() {
     let mut keys: Vec<_> = keys().into_iter().map(|(x, _)| x).collect();
     keys.sort();
 
@@ -1389,7 +1654,7 @@ async fn missing_leader() {
     // Spawn the consensus engine and sink the primary channel.
     let (tx_waiter, rx_waiter) = channel(1);
     let (tx_primary, mut rx_primary) = channel(1);
-    let (tx_output, _rx_output) = channel(1);
+    let (tx_output, mut rx_output) = channel(1);
     Consensus::spawn(
         mock_committee(),
         /* gc_depth */ 50,
@@ -1406,13 +1671,20 @@ async fn missing_leader() {
 
     tokio::time::timeout(std::time::Duration::from_secs(1), async {
         loop {
-            match rx_primary.recv().await {
-                Some(ConsensusCommand::LeaderRequest(..)) => break,
-                Some(_) => continue,
-                None => panic!("consensus command channel closed"),
+            tokio::select! {
+                command = rx_primary.recv() => match command {
+                    Some(ConsensusCommand::LeaderRequest(..)) => panic!("vote-free complete history must permit skipping without retrieval"),
+                    Some(_) => {},
+                    None => panic!("consensus command channel closed before output"),
+                },
+                block = rx_output.recv() => match block {
+                    Some(block) if block.round() >= 4 => break,
+                    Some(_) => {},
+                    None => panic!("application output channel closed"),
+                },
             }
         }
     })
     .await
-    .expect("rule 3 did not request the missing leader");
+    .expect("complete fallback history did not release the finalized prefix");
 }

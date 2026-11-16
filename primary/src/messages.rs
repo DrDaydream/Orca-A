@@ -2,15 +2,15 @@
 use crate::error::{DagError, DagResult};
 use crate::primary::Round;
 use config::{Committee, WorkerId};
-use crypto::{Digest, Hash, PublicKey, Signature, SignatureService};
+use crypto::{Digest, Hash, PublicKey, Signature, SignatureService, SignatureVerifier};
 use ed25519_dalek::Digest as _;
 use ed25519_dalek::Sha512;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::convert::TryInto;
 use std::fmt;
 
-#[derive(Clone, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default, Eq, PartialEq)]
 pub struct Header {
     pub author: PublicKey,
     pub round: Round,
@@ -64,6 +64,7 @@ impl Header {
                 && self.weak_edges.is_disjoint(&self.virtual_edges),
             DagError::MalformedHeader(self.id.clone())
         );
+
         let max_weak = committee.size().saturating_sub(1) / 3;
         ensure!(
             self.weak_edges.len() <= max_weak,
@@ -135,70 +136,199 @@ impl fmt::Display for Header {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-pub struct GradeOneVote {
+/// Bound the data portion so a complete proposal fits the network frame limit.
+pub const MAX_PROPOSAL_BYTES: usize = 4 * 1024 * 1024;
+/// Leave room for the message tag below the transport's 8 MiB frame limit.
+pub const MAX_PROPOSAL_WIRE_BYTES: u64 = 7 * 1024 * 1024;
+
+pub fn batch_digest(bytes: &[u8]) -> Digest {
+    Digest(Sha512::digest(bytes).as_slice()[..32].try_into().unwrap())
+}
+
+pub fn batch_key(digest: &Digest) -> Vec<u8> {
+    [b"orca-batch-v2/".as_ref(), digest.as_ref()].concat()
+}
+
+#[cfg(test)] // Retired storage key, used only to check compatibility in tests.
+pub fn grade_one_key(digest: &Digest) -> Vec<u8> {
+    [b"orca-ready-v2/".as_ref(), digest.as_ref()].concat()
+}
+
+/// A signed Header published only after its complete payload is retained.
+/// A distinct prefix avoids interpreting legacy full proposals as headers.
+pub fn proposal_header_key(digest: &Digest) -> Vec<u8> {
+    [b"orca-proposal-header-v3/".as_ref(), digest.as_ref()].concat()
+}
+
+pub fn local_votes_key(digest: &Digest) -> Vec<u8> {
+    [b"orca-local-votes-v2/".as_ref(), digest.as_ref()].concat()
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Proposal {
+    pub header: Header,
+    #[serde(with = "crate::batch_bytes")]
+    pub batches: BTreeMap<Digest, Vec<u8>>,
+}
+
+impl Proposal {
+    pub fn verify(&self, committee: &Committee) -> DagResult<()> {
+        self.header.verify(committee)?;
+        ensure!(
+            bincode::serialized_size(self)? <= MAX_PROPOSAL_WIRE_BYTES,
+            DagError::MalformedHeader(self.header.id.clone())
+        );
+        ensure!(
+            self.batches.len() == self.header.payload.len()
+                && self.batches.values().map(Vec::len).sum::<usize>() <= MAX_PROPOSAL_BYTES,
+            DagError::MalformedHeader(self.header.id.clone())
+        );
+        for digest in self.header.payload.keys() {
+            ensure!(
+                self.batches
+                    .get(digest)
+                    .map_or(false, |bytes| batch_digest(bytes) == *digest),
+                DagError::MalformedHeader(self.header.id.clone())
+            );
+        }
+        Ok(())
+    }
+
+    pub fn block(&self) -> Certificate {
+        Certificate {
+            header: self.header.clone(),
+            votes: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+pub enum GrbcPhase {
+    Echo,
+    Ready,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GrbcVote {
     pub id: Digest,
     pub round: Round,
     pub origin: PublicKey,
     pub author: PublicKey,
+    pub phase: GrbcPhase,
     pub signature: Signature,
 }
 
-impl GradeOneVote {
+impl GrbcVote {
     pub async fn new(
         header: &Header,
-        author: &PublicKey,
+        author: PublicKey,
+        phase: GrbcPhase,
         signature_service: &mut SignatureService,
     ) -> Self {
-        let vote = Self {
+        let mut vote = Self {
             id: header.id.clone(),
             round: header.round,
             origin: header.author,
-            author: *author,
+            author,
+            phase,
             signature: Signature::default(),
         };
-        let signature = signature_service.request_signature(vote.digest()).await;
-        Self { signature, ..vote }
+        vote.signature = signature_service.request_signature(vote.digest()).await;
+        vote
     }
 
-    pub fn verify(&self, committee: &Committee) -> DagResult<()> {
-        // Ensure the authority has voting rights.
+    pub fn verify(&self, committee: &Committee, verifier: &SignatureVerifier) -> DagResult<()> {
         ensure!(
             committee.stake(&self.author) > 0,
             DagError::UnknownAuthority(self.author)
         );
-
-        // Check the signature.
-        self.signature
-            .verify(&self.digest(), &self.author)
+        ensure!(
+            committee.stake(&self.origin) > 0,
+            DagError::UnknownAuthority(self.origin)
+        );
+        verifier
+            .verify(&self.signature, &self.digest(), &self.author)
             .map_err(DagError::from)
+    }
+
+    pub fn block_digest(&self) -> Digest {
+        Certificate {
+            header: Header {
+                id: self.id.clone(),
+                round: self.round,
+                author: self.origin,
+                ..Header::default()
+            },
+            votes: Vec::new(),
+        }
+        .digest()
     }
 }
 
-impl Hash for GradeOneVote {
+impl Hash for GrbcVote {
     fn digest(&self) -> Digest {
         let mut hasher = Sha512::new();
+        hasher.update(b"orca-grbc-v2");
+        hasher.update([match self.phase {
+            GrbcPhase::Echo => 0,
+            GrbcPhase::Ready => 1,
+        }]);
         hasher.update(&self.id);
         hasher.update(self.round.to_le_bytes());
         hasher.update(&self.origin);
+        hasher.update(&self.author);
         Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
     }
 }
 
-impl fmt::Debug for GradeOneVote {
-    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-        write!(
-            f,
-            "{}: V{}({}, {})",
-            self.digest(),
-            self.round,
-            self.author,
-            self.id
-        )
+/// Batches contain votes by one sender, not a quorum certificate.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GrbcVoteBatch {
+    pub round: Round,
+    pub author: PublicKey,
+    pub phase: GrbcPhase,
+    pub votes: Vec<(Digest, PublicKey, Signature)>,
+}
+
+impl GrbcVoteBatch {
+    pub fn from_votes(votes: Vec<GrbcVote>) -> Option<Self> {
+        let first = votes.first()?;
+        let (round, author, phase) = (first.round, first.author, first.phase);
+        if votes
+            .iter()
+            .any(|v| (v.round, v.author, v.phase) != (round, author, phase))
+        {
+            return None;
+        }
+        Some(Self {
+            round,
+            author,
+            phase,
+            votes: votes
+                .into_iter()
+                .map(|v| (v.id, v.origin, v.signature))
+                .collect(),
+        })
+    }
+
+    pub fn into_votes(self) -> Vec<GrbcVote> {
+        let (round, author, phase) = (self.round, self.author, self.phase);
+        self.votes
+            .into_iter()
+            .map(|(id, origin, signature)| GrbcVote {
+                id,
+                origin,
+                round,
+                author,
+                phase,
+                signature,
+            })
+            .collect()
     }
 }
 
 #[derive(Clone, Serialize, Deserialize, Default)]
+/// Legacy name for a LOCAL delivery record. Never sent as a GRBC proof.
 pub struct Certificate {
     pub header: Header,
     pub votes: Vec<(PublicKey, Signature)>,
@@ -207,9 +337,10 @@ pub struct Certificate {
 /// Delivery events emitted by the primary to the consensus layer.
 #[derive(Clone, Debug)]
 pub enum ConsensusMessage {
-    /// Core formed a quorum for `round - 1`, so the local node entered this round.
+    /// The proposer can enter this round after a strong-parent quorum formed.
     RoundAdvanced(Round),
-    /// A valid author-signed block observed before any quorum certificate or grade.
+    /// Complete author-signed data observed before DAG dependency validation or
+    /// local GRBC delivery, for the experimental early commit/traversal path.
     Observed(Header),
     GradeOne(Certificate),
     GradeTwo(Certificate),
@@ -217,7 +348,9 @@ pub enum ConsensusMessage {
 
 #[derive(Debug)]
 pub enum ConsensusCommand {
+    /// Actual local commit output: Core completes dependencies before GC.
     Cleanup(Certificate),
+    /// A leader and the causal history committed with it, in output order.
     CleanupBatch(Vec<Certificate>),
     LeaderRequest(Round, PublicKey),
 }
@@ -235,34 +368,6 @@ impl Certificate {
                 ..Self::default()
             })
             .collect()
-    }
-
-    pub fn verify(&self, committee: &Committee) -> DagResult<()> {
-        // Genesis certificates are always valid.
-        if Self::genesis(committee).contains(self) {
-            return Ok(());
-        }
-
-        // Check the embedded header.
-        self.header.verify(committee)?;
-
-        // Ensure the certificate has a quorum.
-        let mut weight = 0;
-        let mut used = HashSet::new();
-        for (name, _) in self.votes.iter() {
-            ensure!(!used.contains(name), DagError::AuthorityReuse(*name));
-            let voting_rights = committee.stake(name);
-            ensure!(voting_rights > 0, DagError::UnknownAuthority(*name));
-            used.insert(*name);
-            weight += voting_rights;
-        }
-        ensure!(
-            weight >= committee.quorum_threshold(),
-            DagError::CertificateRequiresQuorum
-        );
-
-        // Check the signatures.
-        Signature::verify_batch(&self.digest(), &self.votes).map_err(DagError::from)
     }
 
     pub fn round(&self) -> Round {

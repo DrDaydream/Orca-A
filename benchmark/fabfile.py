@@ -32,8 +32,10 @@ def local(ctx, debug=False):
     try:
         ret = LocalBench(bench_params, node_params).run(debug)
         print(ret.result())
+        ret.print_comparison(bench_params['duration'], 'logs/comparison.json')
     except BenchError as e:
         Print.error(e)
+        raise
 
 
 @task
@@ -116,6 +118,7 @@ def remote(ctx, debug=False):
         Bench(ctx).run(bench_params, node_params, debug)
     except BenchError as e:
         Print.error(e)
+        raise
 
 
 @task

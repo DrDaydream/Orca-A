@@ -1,14 +1,18 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-use crate::certificate_waiter::CertificateWaiter;
 use crate::core::Core;
 use crate::error::DagError;
 use crate::garbage_collector::GarbageCollector;
 use crate::header_waiter::HeaderWaiter;
-use crate::helper::Helper;
-use crate::messages::{Certificate, ConsensusCommand, ConsensusMessage, GradeOneVote, Header};
+use crate::helper::{Helper, RepairRequest};
+use crate::messages::{
+    batch_digest, batch_key, ConsensusCommand, ConsensusMessage, GrbcVote,
+    GrbcVoteBatch as VoteBatch, Proposal, MAX_PROPOSAL_BYTES,
+};
 use crate::payload_receiver::PayloadReceiver;
+use crate::proposal_processor::{spawn_proposal_processors, ProposalTracker, QueuedProposal};
 use crate::proposer::Proposer;
 use crate::synchronizer::Synchronizer;
+use crate::vote_sender::spawn_vote_sender;
 use async_trait::async_trait;
 use bytes::Bytes;
 use config::{Committee, KeyPair, Parameters, WorkerId};
@@ -26,17 +30,22 @@ use tokio::sync::mpsc::{channel, Receiver, Sender};
 /// The default channel capacity for each channel of the primary.
 pub const CHANNEL_CAPACITY: usize = 1_000;
 
+#[cfg(test)]
+#[path = "tests/vote_transport_tests.rs"]
+mod vote_transport_tests;
+
 /// The round number.
 pub type Round = u64;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum PrimaryMessage {
-    Header(Header),
-    GradeOneVote(GradeOneVote),
-    GradeOneVoteBatch(Vec<GradeOneVote>),
-    Certificate(Certificate),
+    Proposal(Proposal),
+    GrbcVote(GrbcVote),
+    GrbcVoteBatch(VoteBatch),
     LeaderRequest(Round, PublicKey, /* requestor */ PublicKey),
     CertificatesRequest(Vec<Digest>, /* requestor */ PublicKey),
+    /// Request saved ECHO/READY votes when the complete proposal is already local.
+    VotesRequest(Vec<Digest>, /* requestor */ PublicKey),
 }
 
 /// The messages sent by the primary to its workers.
@@ -54,7 +63,7 @@ pub enum PrimaryWorkerMessage {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum WorkerPrimaryMessage {
     /// The worker indicates it sealed a new batch.
-    OurBatch(Digest, WorkerId),
+    OurBatch(Vec<u8>, WorkerId),
     /// The worker indicates it received a batch's digest from another authority.
     OthersBatch(Digest, WorkerId),
 }
@@ -75,34 +84,22 @@ impl Primary {
         let (tx_parents, rx_parents) = channel(CHANNEL_CAPACITY);
         let (tx_headers, rx_headers) = channel(CHANNEL_CAPACITY);
         let (tx_sync_headers, rx_sync_headers) = channel(CHANNEL_CAPACITY);
-        let (tx_sync_certificates, rx_sync_certificates) = channel(CHANNEL_CAPACITY);
         let (tx_headers_loopback, rx_headers_loopback) = channel(CHANNEL_CAPACITY);
-        let (tx_certificates_loopback, rx_certificates_loopback) = channel(CHANNEL_CAPACITY);
         let (tx_primary_messages, rx_primary_messages) = channel(CHANNEL_CAPACITY);
+        // Bound resident bulk data independently from the small control messages.
+        let (tx_remote_proposals, rx_remote_proposals) = channel(32);
+        let (tx_stored_proposals, rx_stored_proposals) = channel(CHANNEL_CAPACITY);
+        let (tx_votes, rx_votes) = channel(CHANNEL_CAPACITY);
         let (tx_cert_requests, rx_cert_requests) = channel(CHANNEL_CAPACITY);
         let (tx_consensus_commands, rx_consensus_commands) = channel(CHANNEL_CAPACITY);
         let (tx_cleanup, rx_cleanup) = channel(CHANNEL_CAPACITY);
 
         tokio::spawn(async move {
             while let Some(command) = rx_consensus.recv().await {
-                match command {
-                    ConsensusCommand::Cleanup(certificate) => tx_cleanup
-                        .send(certificate)
-                        .await
-                        .expect("Failed to send cleanup"),
-                    ConsensusCommand::CleanupBatch(certificates) => {
-                        for certificate in certificates {
-                            tx_cleanup
-                                .send(certificate)
-                                .await
-                                .expect("Failed to send cleanup batch");
-                        }
-                    }
-                    command => tx_consensus_commands
-                        .send(command)
-                        .await
-                        .expect("Failed to send consensus command"),
-                }
+                tx_consensus_commands
+                    .send(command)
+                    .await
+                    .expect("Failed to send consensus command");
             }
         });
 
@@ -116,6 +113,7 @@ impl Primary {
         // Atomic variable use to synchronizer all tasks with the latest consensus round. This is only
         // used for cleanup. The only tasks that write into this variable is `GarbageCollector`.
         let consensus_round = Arc::new(AtomicU64::new(0));
+        let in_flight = ProposalTracker::default();
 
         // Spawn the network receiver listening to messages from the other primaries.
         let mut address = committee
@@ -128,7 +126,9 @@ impl Primary {
             /* handler */
             PrimaryReceiverHandler {
                 tx_primary_messages,
-                tx_cert_requests,
+                tx_remote_proposals,
+                in_flight: in_flight.clone(),
+                tx_cert_requests: tx_cert_requests.clone(),
             },
         );
         info!(
@@ -146,6 +146,7 @@ impl Primary {
             address,
             /* handler */
             WorkerReceiverHandler {
+                store: store.clone(),
                 tx_our_digests,
                 tx_others_digests,
             },
@@ -157,17 +158,33 @@ impl Primary {
 
         // The `Synchronizer` provides auxiliary methods helping to `Core` to sync.
         let synchronizer = Synchronizer::new(
-            name,
             &committee,
             store.clone(),
             /* tx_header_waiter */ tx_sync_headers,
-            /* tx_certificate_waiter */ tx_sync_certificates,
         );
 
         // The `SignatureService` is used to require signatures on specific digests.
         let signature_service = SignatureService::new(secret);
+        spawn_vote_sender(
+            name,
+            committee.clone(),
+            consensus_round.clone(),
+            parameters.gc_depth,
+            rx_votes,
+        );
+        spawn_proposal_processors(
+            name,
+            committee.clone(),
+            store.clone(),
+            consensus_round.clone(),
+            parameters.gc_depth,
+            rx_remote_proposals,
+            rx_headers,
+            tx_stored_proposals,
+            in_flight.clone(),
+        );
 
-        // The `Core` receives and handles headers, votes, and certificates from the other primaries.
+        // Core handles compact validated headers and GRBC votes.
         Core::spawn(
             name,
             committee.clone(),
@@ -178,11 +195,14 @@ impl Primary {
             parameters.gc_depth,
             /* rx_primaries */ rx_primary_messages,
             /* rx_header_waiter */ rx_headers_loopback,
-            /* rx_certificate_waiter */ rx_certificates_loopback,
-            /* rx_proposer */ rx_headers,
-            /* rx_consensus */ rx_consensus_commands,
+            rx_stored_proposals,
+            in_flight,
+            tx_votes.clone(),
+            tx_cert_requests,
             tx_consensus,
             /* tx_proposer */ tx_parents,
+            rx_consensus_commands,
+            tx_cleanup,
         );
 
         // Keeps track of the latest consensus round and allows other tasks to clean up their their internal state
@@ -206,14 +226,6 @@ impl Primary {
             /* tx_core */ tx_headers_loopback,
         );
 
-        // The `CertificateWaiter` waits to receive all the ancestors of a certificate before looping it back to the
-        // `Core` for further processing.
-        CertificateWaiter::spawn(
-            store.clone(),
-            /* rx_synchronizer */ rx_sync_certificates,
-            /* tx_core */ tx_certificates_loopback,
-        );
-
         // When the `Core` collects enough parent certificates, the `Proposer` generates a new header with new batch
         // digests from our workers and it back to the `Core`.
         Proposer::spawn(
@@ -228,7 +240,7 @@ impl Primary {
         );
 
         // The `Helper` is dedicated to reply to certificates requests from other primaries.
-        Helper::spawn(committee.clone(), store, rx_cert_requests);
+        Helper::spawn(committee.clone(), store, rx_cert_requests, tx_votes);
 
         // NOTE: This log entry is used to compute performance.
         info!(
@@ -247,7 +259,9 @@ impl Primary {
 #[derive(Clone)]
 struct PrimaryReceiverHandler {
     tx_primary_messages: Sender<PrimaryMessage>,
-    tx_cert_requests: Sender<(Vec<Digest>, PublicKey)>,
+    tx_remote_proposals: Sender<QueuedProposal>,
+    in_flight: ProposalTracker,
+    tx_cert_requests: Sender<RepairRequest>,
 }
 
 #[async_trait]
@@ -256,13 +270,33 @@ impl MessageHandler for PrimaryReceiverHandler {
         // Reply with an ACK.
         let _ = writer.send(Bytes::from("Ack")).await;
 
-        // Deserialize and parse the message.
-        match bincode::deserialize(&serialized).map_err(DagError::SerializationError)? {
+        // Large frames decode away from runtime threads. Independent TCP
+        // connections and queues let votes bypass a full bulk proposal queue.
+        let message = if serialized.len() > 64 * 1024 {
+            tokio::task::spawn_blocking(move || bincode::deserialize::<PrimaryMessage>(&serialized))
+                .await??
+        } else {
+            bincode::deserialize(&serialized).map_err(DagError::SerializationError)?
+        };
+        match message {
+            PrimaryMessage::Proposal(proposal) => {
+                // Register before waiting for space in the bounded bulk queue.
+                let guard = self.in_flight.track(&proposal.header);
+                self.tx_remote_proposals
+                    .send((proposal, guard))
+                    .await
+                    .expect("Failed to enqueue remote proposal");
+            }
             PrimaryMessage::CertificatesRequest(missing, requestor) => self
                 .tx_cert_requests
-                .send((missing, requestor))
+                .send(RepairRequest::Proposals(missing, requestor))
                 .await
                 .expect("Failed to send primary message"),
+            PrimaryMessage::VotesRequest(missing, requestor) => self
+                .tx_cert_requests
+                .send(RepairRequest::Votes(missing, requestor))
+                .await
+                .expect("Failed to send vote repair request"),
             request => self
                 .tx_primary_messages
                 .send(request)
@@ -276,30 +310,38 @@ impl MessageHandler for PrimaryReceiverHandler {
 /// Defines how the network receiver handles incoming workers messages.
 #[derive(Clone)]
 struct WorkerReceiverHandler {
-    tx_our_digests: Sender<(Digest, WorkerId)>,
+    store: Store,
+    tx_our_digests: Sender<(Digest, WorkerId, usize)>,
     tx_others_digests: Sender<(Digest, WorkerId)>,
 }
 
 #[async_trait]
 impl MessageHandler for WorkerReceiverHandler {
-    async fn dispatch(
-        &self,
-        _writer: &mut Writer,
-        serialized: Bytes,
-    ) -> Result<(), Box<dyn Error>> {
-        // Deserialize and parse the message.
+    async fn dispatch(&self, writer: &mut Writer, serialized: Bytes) -> Result<(), Box<dyn Error>> {
         match bincode::deserialize(&serialized).map_err(DagError::SerializationError)? {
-            WorkerPrimaryMessage::OurBatch(digest, worker_id) => self
-                .tx_our_digests
-                .send((digest, worker_id))
-                .await
-                .expect("Failed to send workers' digests"),
-            WorkerPrimaryMessage::OthersBatch(digest, worker_id) => self
-                .tx_others_digests
-                .send((digest, worker_id))
-                .await
-                .expect("Failed to send workers' digests"),
+            WorkerPrimaryMessage::OurBatch(batch, worker_id) => {
+                if batch.len() > MAX_PROPOSAL_BYTES {
+                    return Err("batch exceeds complete-proposal payload limit".into());
+                }
+                let digest = batch_digest(&batch);
+                let size = batch.len();
+                let mut store = self.store.clone();
+                store
+                    .write_batch_if_absent(std::iter::once((batch_key(&digest), batch)).collect())
+                    .await?;
+                self.tx_our_digests
+                    .send((digest, worker_id, size))
+                    .await
+                    .expect("Failed to send local batch");
+            }
+            WorkerPrimaryMessage::OthersBatch(digest, worker_id) => {
+                self.tx_others_digests
+                    .send((digest, worker_id))
+                    .await
+                    .expect("Failed to send worker digest");
+            }
         }
+        let _ = writer.send(Bytes::from("Ack")).await;
         Ok(())
     }
 }

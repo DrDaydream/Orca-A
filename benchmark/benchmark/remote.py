@@ -2,13 +2,19 @@
 from collections import OrderedDict
 from fabric import Connection, ThreadingGroup as Group
 from fabric.exceptions import GroupException
+from invoke.exceptions import Failure
 from paramiko import RSAKey
 from paramiko.ssh_exception import PasswordRequiredException, SSHException
-from os.path import basename, splitext
+from os import environ, pathsep
+from os.path import basename, splitext, expanduser, join
+from shlex import quote
 from time import sleep
 from math import ceil
 from copy import deepcopy
+from datetime import datetime
+from re import search
 import subprocess
+from time import monotonic, time
 
 from benchmark.config import Committee, Key, NodeParameters, BenchParameters, ConfigError
 from benchmark.utils import BenchError, Print, PathMaker, progress_bar
@@ -52,34 +58,60 @@ class Bench:
             if output.stderr:
                 raise ExecutionError(output.stderr)
 
-    def install(self):
-        Print.info('Installing rust and cloning the repo...')
+    def install(self, hosts=None):
+        hosts = self.manager.hosts(flat=True) if hosts is None else hosts
+        if not hosts:
+            raise BenchError('No testbed instances available', RuntimeError('Run fab info'))
+
+        packages = (
+            'build-essential cmake clang-14 libclang-14-dev pkg-config '
+            'libssl-dev curl ca-certificates git tmux chrony'
+        )
+        setup = ' && '.join([
+            'set -eo pipefail',
+            'if command -v cloud-init >/dev/null 2>&1; then '
+            'orca_cloud_status=0; sudo cloud-init status --wait || orca_cloud_status=$?; '
+            'if [ "$orca_cloud_status" -ne 0 ] && [ "$orca_cloud_status" -ne 2 ]; '
+            'then exit "$orca_cloud_status"; fi; fi',
+            f'orca_missing=0; for orca_package in {packages}; do '
+            'if [ "$(dpkg-query -W -f=\'${Status}\' "$orca_package" 2>/dev/null)" '
+            '!= "install ok installed" ]; then orca_missing=1; fi; done; '
+            'if [ "$orca_missing" -eq 1 ]; then sudo apt-get update && '
+            'sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y '
+            f'{packages}; fi',
+            'export PATH="$HOME/.cargo/bin:$PATH"',
+            'if ! command -v rustup >/dev/null 2>&1; then '
+            'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | '
+            'sh -s -- -y --profile minimal --default-toolchain 1.85.0; fi',
+            'if ! rustup run 1.85.0 rustc --version >/dev/null 2>&1; then '
+            'rustup toolchain install 1.85.0 --profile minimal; fi',
+            'sudo systemctl enable --now chrony',
+            'chronyc waitsync 60 0.1',
+        ])
+        repo = quote(self.settings.repo_name)
+        url = quote(self.settings.repo_url)
+        branch = quote(self.settings.branch)
         cmd = [
-            'sudo apt-get update',
-            'sudo apt-get -y upgrade',
-            'sudo apt-get -y autoremove',
-
-            # The following dependencies prevent the error: [error: linker `cc` not found].
-            'sudo apt-get -y install build-essential',
-            'sudo apt-get -y install cmake',
-
-            # Install rust (non-interactive).
-            'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y',
-            'source $HOME/.cargo/env',
-            'rustup default stable',
-
-            # This is missing from the Rocksdb installer (needed for Rocksdb).
-            'sudo apt-get install -y clang',
-
-            # Clone the repo.
-            f'(git clone {self.settings.repo_url} || (cd {self.settings.repo_name} ; git pull))'
+            setup,
+            f'(test -d {repo}/.git || git clone --branch {branch} {url} {repo})',
+            f'(cd {repo} && rustup override set 1.85.0)',
         ]
-        hosts = self.manager.hosts(flat=True)
         try:
+            Print.info('Checking build dependencies on the controller...')
+            subprocess.run(['bash', '-c', setup], check=True)
+            environ['PATH'] = expanduser('~/.cargo/bin') + pathsep + environ.get('PATH', '')
+            environ['RUSTUP_TOOLCHAIN'] = '1.85.0'
+            for variable in (
+                'RUSTFLAGS', 'CARGO_ENCODED_RUSTFLAGS',
+                'CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS',
+                'TOKIO_WORKER_THREADS',
+            ):
+                environ.pop(variable, None)
+            Print.info(f'Checking dependencies on {len(hosts)} testbed machines...')
             g = Group(*hosts, user='ubuntu', connect_kwargs=self.connect)
-            g.run(' && '.join(cmd), hide=True)
+            g.run(' && '.join(cmd), hide=False)
             Print.heading(f'Initialized testbed of {len(hosts)} nodes')
-        except (GroupException, ExecutionError) as e:
+        except (GroupException, ExecutionError, subprocess.SubprocessError) as e:
             e = FabricError(e) if isinstance(e, GroupException) else e
             raise BenchError('Failed to install repo on testbed', e)
 
@@ -137,27 +169,53 @@ class Bench:
         output = c.run(cmd, hide=True)
         self._check_stderr(output)
 
+    @staticmethod
+    def _controller_revision():
+        # Benchmark parameters and local settings may be edited between runs;
+        # deployed native code must still match the controller's HEAD.
+        root = join(PathMaker.node_crate_path(), '..')
+        result = subprocess.run(
+            ['git', 'diff', '--quiet', 'HEAD', '--', '*.rs', 'Cargo.toml',
+             '**/Cargo.toml', 'Cargo.lock', '.cargo', 'rust-toolchain',
+             'rust-toolchain.toml'], cwd=root,
+        )
+        if result.returncode:
+            raise ExecutionError(
+                'Controller Rust sources or build configuration differ from HEAD; '
+                'commit or revert them before running fab remote'
+            )
+        return subprocess.check_output(
+            ['git', 'rev-parse', 'HEAD'], cwd=root, text=True,
+        ).strip()
+
     def _update(self, hosts, collocate):
         if collocate:
             ips = list(set(hosts))
         else:
             ips = list(set([x for y in hosts for x in y]))
 
-        Print.info(
-            f'Updating {len(ips)} machines (branch "{self.settings.branch}")...'
-        )
+        revision = self._controller_revision()
+        repo = quote(self.settings.repo_name)
+        branch = quote(self.settings.branch)
+        Print.info(f'Building commit {revision} on {len(ips)} machines...')
         cmd = [
-            f'(cd {self.settings.repo_name} && git fetch -f)',
-            f'(cd {self.settings.repo_name} && git checkout -f {self.settings.branch})',
-            f'(cd {self.settings.repo_name} && git pull -f)',
-            'source $HOME/.cargo/env',
-            f'(cd {self.settings.repo_name}/node && {CommandMaker.compile()})',
-            CommandMaker.alias_binaries(
-                f'./{self.settings.repo_name}/target/release/'
-            )
+            'source "$HOME/.cargo/env"',
+            'export RUSTUP_TOOLCHAIN=1.85.0',
+            'unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS '
+            'CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS TOKIO_WORKER_THREADS',
+            f'(cd {repo} '
+            '&& (git diff --quiet && git diff --cached --quiet || { '
+            'echo "Testbed repository has uncommitted tracked changes; '
+            'save or revert them before running fab remote." >&2; exit 1; }) '
+            f'&& git fetch origin {branch} '
+            f'&& git checkout --detach {revision} '
+            f'&& test "$(git rev-parse HEAD)" = {revision} '
+            f'&& cd node && {CommandMaker.compile()})',
+            f'ln -sfn {quote("./" + self.settings.repo_name + "/target/release/node")} ./node',
+            f'ln -sfn {quote("./" + self.settings.repo_name + "/target/release/benchmark_client")} ./benchmark_client',
         ]
         g = Group(*ips, user='ubuntu', connect_kwargs=self.connect)
-        g.run(' && '.join(cmd), hide=True)
+        g.run(' && '.join(cmd), hide=False)
 
     def _config(self, hosts, node_parameters, bench_parameters):
         Print.info('Generating configuration files...')
@@ -210,6 +268,44 @@ class Bench:
 
         return committee
 
+    def _wait_for_clients(self, clients, duration):
+        """Keep nodes alive for the complete window used by comparison_metrics."""
+        if not clients:
+            raise ExecutionError('No benchmark clients were launched')
+        timeout = monotonic() + 120
+        starts = {}
+        while len(starts) < len(clients):
+            for host, logfile in clients:
+                identity = (host, logfile)
+                if identity in starts:
+                    continue
+                remaining = timeout - monotonic()
+                if remaining <= 0:
+                    raise ExecutionError('Clients did not start within 120 seconds')
+                try:
+                    with Connection(host, user='ubuntu', connect_kwargs=self.connect,
+                                    connect_timeout=min(10, remaining)) as connection:
+                        output = connection.run(
+                            f'if test -f {quote(logfile)}; then cat {quote(logfile)}; fi',
+                            hide=True, timeout=min(10, remaining),
+                        )
+                except (Failure, SSHException, OSError) as e:
+                    raise ExecutionError(f'Failed to read client startup log {logfile}') from e
+                match = search(r'(\d{4}-\S+Z)[^\n]* Start ', output.stdout)
+                if match:
+                    starts[identity] = datetime.fromisoformat(
+                        match[1].replace('Z', '+00:00')
+                    ).timestamp()
+            if monotonic() >= timeout:
+                raise ExecutionError('Clients did not start within 120 seconds')
+            if len(starts) < len(clients):
+                sleep(0.1)
+        deadline = min(starts.values()) + duration
+        if max(starts.values()) >= deadline:
+            raise ExecutionError('Client startup skew exceeds the measurement window')
+        while time() < deadline:
+            sleep(min(0.1, max(0, deadline - time())))
+
     def _run_single(self, rate, committee, bench_parameters, node_parameters, debug=False):
         faults = bench_parameters.faults
 
@@ -228,6 +324,7 @@ class Bench:
         silence_schedules = build_client_schedules(
             names, faults, bench_parameters.duration, silence_slot_ms
         )
+        clients = []
         for i, addresses in enumerate(workers_addresses):
             for (id, address) in addresses:
                 host = Committee.ip(address)
@@ -241,6 +338,7 @@ class Bench:
                 )
                 log_file = PathMaker.client_log_file(i, id)
                 self._background_run(host, cmd, log_file)
+                clients.append((host, log_file))
 
         # Run every primary; adversarial authorities are selected per round.
         Print.info('Booting primaries...')
@@ -273,10 +371,10 @@ class Bench:
                 log_file = PathMaker.worker_log_file(i, id)
                 self._background_run(host, cmd, log_file)
 
-        # Wait for all transactions to be processed.
+        # Use the same Start event and fixed cutoff as comparison_metrics.
         duration = bench_parameters.duration
-        for _ in progress_bar(range(20), prefix=f'Running benchmark ({duration} sec):'):
-            sleep(ceil(duration / 20))
+        Print.info(f'Running benchmark ({duration} sec)...')
+        self._wait_for_clients(clients, duration)
         self.kill(hosts=hosts, delete_logs=False)
 
     def _logs(self, committee, faults):
@@ -325,14 +423,24 @@ class Bench:
 
         # Select which hosts to use.
         selected_hosts = self._select_hosts(bench_parameters)
-        if not selected_hosts:
-            Print.warn('There are not enough instances available')
-            return
+        if len(selected_hosts) != max(bench_parameters.nodes):
+            raise BenchError('There are not enough instances available', RuntimeError('Run fab info'))
+
+        try:
+            self._controller_revision()
+        except (ExecutionError, subprocess.SubprocessError, OSError) as e:
+            raise BenchError('Controller code is not ready for remote benchmarking', e)
+
+        # A plain fab remote also prepares fresh Ubuntu 24.04 machines.
+        install_hosts = selected_hosts if bench_parameters.collocate else [
+            ip for group in selected_hosts for ip in group
+        ]
+        self.install(hosts=list(dict.fromkeys(install_hosts)))
 
         # Update nodes.
         try:
             self._update(selected_hosts, bench_parameters.collocate)
-        except (GroupException, ExecutionError) as e:
+        except (GroupException, ExecutionError, subprocess.SubprocessError, OSError) as e:
             e = FabricError(e) if isinstance(e, GroupException) else e
             raise BenchError('Failed to update nodes', e)
 
@@ -363,17 +471,23 @@ class Bench:
 
                         faults = bench_parameters.faults
                         logger = self._logs(committee_copy, faults)
-                        logger.print(PathMaker.result_file(
+                        print(logger.result())
+                        result_file = PathMaker.result_file(
                             faults,
                             n, 
                             bench_parameters.workers,
                             bench_parameters.collocate,
                             r, 
                             bench_parameters.tx_size, 
-                        ))
-                    except (subprocess.SubprocessError, GroupException, ParseError) as e:
-                        self.kill(hosts=selected_hosts)
+                        )
+                        logger.print(result_file)
+                        logger.print_comparison(
+                            bench_parameters.duration,
+                            f'{result_file[:-4]}-run-{i + 1}.comparison.json',
+                        )
+                    except (OSError, subprocess.SubprocessError, GroupException,
+                            ExecutionError, ParseError) as e:
+                        self.kill(hosts=committee_copy.ips())
                         if isinstance(e, GroupException):
                             e = FabricError(e)
-                        Print.error(BenchError('Benchmark failed', e))
-                        continue
+                        raise BenchError('Benchmark failed', e) from e

@@ -56,7 +56,7 @@ async fn propose_payload() {
     let digest = Digest(name.0);
     let worker_id = 0;
     tx_our_digests
-        .send((digest.clone(), worker_id))
+        .send((digest.clone(), worker_id, 100))
         .await
         .unwrap();
 
@@ -110,36 +110,46 @@ async fn propose_grbc_edges() {
 }
 
 #[tokio::test]
-async fn proposer_jumps_to_a_higher_quorum_round() {
+async fn payload_budget_keeps_remaining_batches_for_the_next_round() {
     let (name, secret) = keys().pop().unwrap();
-    let signature_service = SignatureService::new(secret);
-    let (tx_parents, rx_parents) = channel(1);
-    let (_tx_our_digests, rx_our_digests) = channel(1);
-    let (tx_headers, mut rx_headers) = channel(1);
-
+    let (tx_parents, rx_parents) = channel(10);
+    let (tx_batches, rx_batches) = channel(10);
+    let (tx_headers, mut rx_headers) = channel(10);
     Proposer::spawn(
         name,
         &committee(),
-        signature_service,
-        1_000,
-        20,
+        SignatureService::new(secret),
+        64,
+        50,
         rx_parents,
-        rx_our_digests,
+        rx_batches,
         tx_headers,
     );
-
-    // Consume the initial round-1 proposal, then emulate Core delivering the
-    // aggregated GRBC parent set for a substantially higher round. In
-    // production Core emits this tuple only after its quorum aggregator fires.
-    rx_headers.recv().await.unwrap();
-    let parent = Digest([9; 32]);
-    tx_parents
-        .send((vec![parent.clone()], Vec::new(), Vec::new(), 5))
+    let first = Digest([1; 32]);
+    let second = Digest([2; 32]);
+    tx_batches
+        .send((first.clone(), 0, MAX_PROPOSAL_BYTES / 2 + 1))
         .await
         .unwrap();
-
-    let header = rx_headers.recv().await.unwrap();
-    assert_eq!(header.round, 6);
-    assert!(header.parents.contains(&parent));
-    assert!(header.verify(&committee()).is_ok());
+    tx_batches
+        .send((second.clone(), 0, MAX_PROPOSAL_BYTES / 2 + 1))
+        .await
+        .unwrap();
+    let one = tokio::time::timeout(Duration::from_secs(2), rx_headers.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(one.payload.len(), 1);
+    assert!(one.payload.contains_key(&first));
+    tx_parents
+        .send((vec![Digest([3; 32])], vec![], vec![], 1))
+        .await
+        .unwrap();
+    let two = tokio::time::timeout(Duration::from_secs(2), rx_headers.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(two.round, 2);
+    assert_eq!(two.payload.len(), 1);
+    assert!(two.payload.contains_key(&second));
 }

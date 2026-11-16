@@ -8,3 +8,8 @@ CLANG_PATH = { value = "/usr/bin/clang-14", force = true }
 CC = { value = "/usr/bin/clang-14", force = true }
 CXX = { value = "/usr/bin/clang++-14", force = true }
 CXXFLAGS = { value = "-include cstdint", force = true }
+
+# The Ubuntu x86_64 benchmark machines must support SSE4.2 and PCLMUL.
+# These features also enable RocksDB's hardware CRC32C implementation.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-feature=+sse4.2,+pclmulqdq"]

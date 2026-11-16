@@ -30,15 +30,15 @@ pub fn committee() -> Committee {
             .enumerate()
             .map(|(i, (id, _))| {
                 let primary = PrimaryAddresses {
-                    primary_to_primary: format!("127.0.0.1:{}", 100 + i).parse().unwrap(),
-                    worker_to_primary: format!("127.0.0.1:{}", 200 + i).parse().unwrap(),
+                    primary_to_primary: format!("127.0.0.1:{}", 1_100 + i).parse().unwrap(),
+                    worker_to_primary: format!("127.0.0.1:{}", 1_200 + i).parse().unwrap(),
                 };
                 let workers = vec![(
                     0,
                     WorkerAddresses {
-                        primary_to_worker: format!("127.0.0.1:{}", 300 + i).parse().unwrap(),
-                        transactions: format!("127.0.0.1:{}", 400 + i).parse().unwrap(),
-                        worker_to_worker: format!("127.0.0.1:{}", 500 + i).parse().unwrap(),
+                        primary_to_worker: format!("127.0.0.1:{}", 1_300 + i).parse().unwrap(),
+                        transactions: format!("127.0.0.1:{}", 1_400 + i).parse().unwrap(),
+                        worker_to_worker: format!("127.0.0.1:{}", 1_500 + i).parse().unwrap(),
                     },
                 )]
                 .iter()

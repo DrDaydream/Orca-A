@@ -39,14 +39,17 @@ pub enum DagError {
     #[error("Malformed header {0}")]
     MalformedHeader(Digest),
 
+    #[error("Missing stored batch {0}")]
+    MissingBatch(Digest),
+
     #[error("Received message from unknown authority {0}")]
     UnknownAuthority(PublicKey),
 
     #[error("Authority {0} appears in quorum more than once")]
     AuthorityReuse(PublicKey),
 
-    #[error("Received unexpected vote fo header {0}")]
-    UnexpectedGradeOneVote(Digest),
+    #[error("Received unexpected GRBC vote for header {0}")]
+    UnexpectedGrbcVote(Digest),
 
     #[error("Received certificate without a quorum")]
     CertificateRequiresQuorum,

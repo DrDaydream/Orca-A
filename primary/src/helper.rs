@@ -1,12 +1,20 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
+use crate::messages::{local_votes_key, GrbcVote};
 use crate::primary::PrimaryMessage;
+use crate::proposal_store::load_proposal;
+use crate::vote_sender::VoteDispatch;
 use bytes::Bytes;
 use config::Committee;
 use crypto::{Digest, PublicKey};
 use log::{error, warn};
 use network::SimpleSender;
 use store::Store;
-use tokio::sync::mpsc::Receiver;
+use tokio::sync::mpsc::{Receiver, Sender};
+
+pub(crate) enum RepairRequest {
+    Proposals(Vec<Digest>, PublicKey),
+    Votes(Vec<Digest>, PublicKey),
+}
 
 /// A task dedicated to help other authorities by replying to their certificates requests.
 pub struct Helper {
@@ -15,16 +23,18 @@ pub struct Helper {
     /// The persistent storage.
     store: Store,
     /// Input channel to receive certificates requests.
-    rx_primaries: Receiver<(Vec<Digest>, PublicKey)>,
+    rx_primaries: Receiver<RepairRequest>,
     /// A network sender to reply to the sync requests.
     network: SimpleSender,
+    tx_votes: Sender<VoteDispatch>,
 }
 
 impl Helper {
     pub fn spawn(
         committee: Committee,
         store: Store,
-        rx_primaries: Receiver<(Vec<Digest>, PublicKey)>,
+        rx_primaries: Receiver<RepairRequest>,
+        tx_votes: Sender<VoteDispatch>,
     ) {
         tokio::spawn(async move {
             Self {
@@ -32,6 +42,7 @@ impl Helper {
                 store,
                 rx_primaries,
                 network: SimpleSender::new(),
+                tx_votes,
             }
             .run()
             .await;
@@ -39,7 +50,11 @@ impl Helper {
     }
 
     async fn run(&mut self) {
-        while let Some((digests, origin)) = self.rx_primaries.recv().await {
+        while let Some(request) = self.rx_primaries.recv().await {
+            let (digests, origin, include_payload) = match request {
+                RepairRequest::Proposals(digests, origin) => (digests, origin, true),
+                RepairRequest::Votes(digests, origin) => (digests, origin, false),
+            };
             // TODO [issue #195]: Do some accounting to prevent bad nodes from monopolizing our resources.
 
             // get the requestors address.
@@ -53,13 +68,35 @@ impl Helper {
 
             // Reply to the request (the best we can).
             for digest in digests {
-                match self.store.read(digest.to_vec()).await {
-                    Ok(Some(data)) => {
-                        // TODO: Remove this deserialization-serialization in the critical path.
-                        let certificate = bincode::deserialize(&data)
-                            .expect("Failed to deserialize our own certificate");
-                        let bytes = bincode::serialize(&PrimaryMessage::Certificate(certificate))
-                            .expect("Failed to serialize our own certificate");
+                // Queue saved votes before reading or serializing the full payload.
+                if let Some(data) = self
+                    .store
+                    .read(local_votes_key(&digest))
+                    .await
+                    .ok()
+                    .flatten()
+                {
+                    let votes: Vec<GrbcVote> =
+                        bincode::deserialize(&data).expect("Failed to deserialize local votes");
+                    self.tx_votes
+                        .send(VoteDispatch {
+                            requestor: Some(origin),
+                            votes,
+                        })
+                        .await
+                        .expect("Failed to enqueue repair votes");
+                }
+                if !include_payload {
+                    continue;
+                }
+                match load_proposal(&mut self.store, &digest).await {
+                    Ok(Some(proposal)) => {
+                        let bytes = tokio::task::spawn_blocking(move || {
+                            bincode::serialize(&PrimaryMessage::Proposal(proposal))
+                        })
+                        .await
+                        .expect("Proposal response task failed")
+                        .expect("Failed to serialize proposal response");
                         self.network.send(address, Bytes::from(bytes)).await;
                     }
                     Ok(None) => (),

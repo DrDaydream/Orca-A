@@ -1,5 +1,5 @@
 # Worker Diagram
-The diagram below illustrates the worker's architecture and could be useful to keep in mind while going through the code.
+This inherited diagram describes the original Narwhal architecture. This branch's worker seals/stores batches and sends their contents to its primary; the normal path has no worker-to-worker ACK quorum. See [the current GRBC flow](../README-GRBC.md#broadcast-and-storage).
 
 <p align="center">
   <img src="https://github.com/asonnino/narwhal/blob/master/.assets/diagram-worker.svg">
