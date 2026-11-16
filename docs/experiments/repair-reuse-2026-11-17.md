@@ -2,12 +2,21 @@
 
 Status: experimental; not promoted as a demonstrated latency improvement.
 Recommended operational branch: orca-a-grbc-echo-ready at
-008ad5d2a8774a2d057474774d38697bf845aa02.
+bf69ba4305ae4752d223cf8203f40f4c261c47c5.
 
 Follow-up correctness finding: a new late-join smoke stalls at committed
 round 52 in BOTH this candidate and the exact 008ad5d baseline using the
-same keys. The DAG keeps advancing. This additional GC/history case remains
-under investigation and prevents claiming full late-join liveness.
+same keys. The DAG keeps advancing. The recommended branch now preserves
+already-observed, never-output history across GC and filters output by exact
+delivered-digest membership. Two new regressions, a same-key late-join smoke
+and a sustained-load check validate that follow-up within its documented
+scope. Never-output metadata and indexes can remain indefinitely, so this
+does not establish bounded memory or general asynchronous liveness.
+
+This experiment intentionally retains the original comparison base and does
+not contain that follow-up. Its measured implementation is bab47db; any
+future promotion must first reapply and evaluate it on the current corrected
+base. Do not use this historical experiment as the operational checkout.
 
 ## Observed repeated work
 
