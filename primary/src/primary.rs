@@ -34,6 +34,10 @@ pub const CHANNEL_CAPACITY: usize = 1_000;
 #[path = "tests/vote_transport_tests.rs"]
 mod vote_transport_tests;
 
+#[cfg(test)]
+#[path = "tests/worker_codec_tests.rs"]
+mod worker_codec_tests;
+
 /// The round number.
 pub type Round = u64;
 
@@ -63,7 +67,14 @@ pub enum PrimaryWorkerMessage {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum WorkerPrimaryMessage {
     /// The worker indicates it sealed a new batch.
-    OurBatch(Vec<u8>, WorkerId),
+    OurBatch(
+        #[serde(
+            serialize_with = "crate::batch_bytes::serialize_raw",
+            deserialize_with = "crate::batch_bytes::deserialize_raw"
+        )]
+        Vec<u8>,
+        WorkerId,
+    ),
     /// The worker indicates it received a batch's digest from another authority.
     OthersBatch(Digest, WorkerId),
 }
