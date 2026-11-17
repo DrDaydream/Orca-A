@@ -1631,7 +1631,10 @@ impl Consensus {
         };
 
         let mut candidate = anchor.round().saturating_sub(3);
-        while candidate > 0 {
+        // Every leader at or below this consecutive prefix is already decided.
+        // Keep causal-history traversal separate: old unoutput vertices may
+        // still be required by an unresolved leader above the prefix.
+        while candidate > state.finalized_round {
             if !state.committed_leaders.contains(&candidate)
                 && !state.skipped_leaders.contains(&candidate)
                 && !state.leader_commit_rules.contains_key(&candidate)

@@ -2154,3 +2154,129 @@ async fn missing_leaders_with_complete_vote_free_history_do_not_block_output() {
     .await
     .expect("complete fallback history did not release the finalized prefix");
 }
+
+#[tokio::test]
+async fn fallback_above_finalized_prefix_still_waits_for_old_causal_history() {
+    // Exercise the first unresolved round in each of the three fallback lanes.
+    for prefix in [60, 61, 62] {
+        let committee = mock_committee();
+        let (tx_primary, _rx_primary) = channel(100);
+        let (tx_output, mut rx_output) = channel(100);
+        let mut consensus = Consensus {
+            committee: committee.clone(),
+            gc_depth: 50,
+            rx_primary: channel(1).1,
+            tx_primary,
+            tx_output: OutputSender::Individual(tx_output),
+            genesis: Certificate::genesis(&committee),
+        };
+        let mut state = State::new(Certificate::genesis(&committee));
+        state.skipped_leaders.extend(1..=prefix);
+        state.finalized_round = prefix;
+
+        let target_round = prefix + 1;
+        let anchor_round = target_round + 3;
+        let authority = consensus.ordering_leader_authority(target_round);
+        let (old_digest, old) = mock_certificate(authority, 1, BTreeSet::new());
+        let (_, mut target) = mock_certificate(authority, target_round, BTreeSet::new());
+        target.header.weak_edges.insert(old_digest.clone());
+        let target_digest = target.digest();
+        let mut parent = target_digest.clone();
+        state.observe(target.clone());
+        for round in target_round + 1..=anchor_round {
+            let (digest, block) = mock_certificate(
+                consensus.ordering_leader_authority(round),
+                round,
+                [parent].iter().cloned().collect(),
+            );
+            state.observe(block);
+            parent = digest;
+        }
+        state.rule_three_anchors[(anchor_round % 3) as usize] = Some(anchor_round);
+
+        consensus.finalize_fallback(anchor_round, &mut state).await;
+        assert_eq!(state.finalized_round, prefix);
+        assert!(!state.skipped_leaders.contains(&target_round));
+        assert!(!state.committed_leaders.contains(&target_round));
+        assert!(rx_output.try_recv().is_err());
+
+        // A finalized leader prefix does not imply output of every old vertex.
+        state.observe(old);
+        consensus.finalize_fallback(anchor_round, &mut state).await;
+        assert_eq!(state.finalized_round, target_round);
+        assert!(state.committed_leaders.contains(&target_round));
+        assert_eq!(rx_output.try_recv().unwrap().digest(), old_digest);
+        assert_eq!(rx_output.try_recv().unwrap().digest(), target_digest);
+        assert!(rx_output.try_recv().is_err());
+        assert_eq!(state.skipped_leaders.len(), prefix as usize);
+    }
+}
+
+#[tokio::test]
+#[ignore = "manual release benchmark for retry cost after long finalized history"]
+async fn benchmark_fallback_retry_cost_after_finalized_history() {
+    use std::time::{Duration, Instant};
+
+    async fn median_retry_time(prefix: Round) -> Duration {
+        let committee = mock_committee();
+        let (tx_primary, mut rx_primary) = channel(10);
+        let (tx_output, mut rx_output) = channel(10);
+        let mut consensus = Consensus {
+            committee: committee.clone(),
+            gc_depth: 50,
+            rx_primary: channel(1).1,
+            tx_primary,
+            tx_output: OutputSender::Individual(tx_output),
+            genesis: Certificate::genesis(&committee),
+        };
+        let mut state = State::new(Certificate::genesis(&committee));
+        state.skipped_leaders.extend(1..=prefix);
+        state.finalized_round = prefix;
+        let anchor_round = prefix + 3;
+        let (_, anchor) = mock_certificate(
+            consensus.ordering_leader_authority(anchor_round),
+            anchor_round,
+            BTreeSet::new(),
+        );
+        state.observe(anchor);
+        state.rule_three_anchors[(anchor_round % 3) as usize] = Some(anchor_round);
+        consensus.finalize_fallback(anchor_round, &mut state).await;
+
+        let mut samples = Vec::new();
+        for _ in 0..21 {
+            let start = Instant::now();
+            consensus.finalize_fallback(anchor_round, &mut state).await;
+            samples.push(start.elapsed());
+        }
+        assert_eq!(state.finalized_round, prefix);
+        assert!(state.rule_three_stacks.iter().all(BTreeSet::is_empty));
+        assert!(rx_primary.try_recv().is_err());
+        assert!(rx_output.try_recv().is_err());
+        samples.sort();
+        samples[samples.len() / 2]
+    }
+
+    // Both cases have zero undecided targets. Only resolved history grows.
+    // Reverse the measurement order to avoid accepting a warm-up effect.
+    let short_first = median_retry_time(600).await;
+    let long_first = median_retry_time(600_000).await;
+    let long_second = median_retry_time(600_000).await;
+    let short_second = median_retry_time(600).await;
+    eprintln!(
+        "fallback_retry short_first_ns={} long_first_ns={} long_second_ns={} short_second_ns={}",
+        short_first.as_nanos(),
+        long_first.as_nanos(),
+        long_second.as_nanos(),
+        short_second.as_nanos()
+    );
+    // This is an opt-in scaling check, with a wide scheduling allowance; it is
+    // not a claim about transaction latency or a timing gate in the normal suite.
+    let allowance = std::cmp::max(short_first, short_second) * 20 + Duration::from_micros(500);
+    assert!(
+        std::cmp::max(long_first, long_second) <= allowance,
+        "retry cost grew with already finalized history: {:?} / {:?}, allowance {:?}",
+        long_first,
+        long_second,
+        allowance
+    );
+}
