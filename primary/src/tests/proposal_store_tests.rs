@@ -10,12 +10,19 @@ use tokio::sync::mpsc::channel;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 fn store(label: &str) -> Store {
-    Store::new(&format!(
-        ".db_test_proposal_storage_{}_{}",
-        label,
-        std::process::id()
-    ))
-    .unwrap()
+    crate::common::fresh_store(&format!("proposal_storage_{}", label))
+}
+
+#[tokio::test]
+async fn repeated_store_fixture_labels_have_independent_data() {
+    let key = b"fixture isolation".to_vec();
+    let value = b"first store only".to_vec();
+    let mut first = store("repeated_label");
+    first.write(key.clone(), value.clone()).await;
+    assert_eq!(first.read(key.clone()).await.unwrap(), Some(value.clone()));
+    let mut second = store("repeated_label");
+    assert_eq!(second.read(key.clone()).await.unwrap(), None);
+    assert_eq!(first.read(key).await.unwrap(), Some(value));
 }
 
 fn with_payload() -> Proposal {

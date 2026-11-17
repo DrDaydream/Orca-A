@@ -58,8 +58,7 @@ mod tests {
         for authority in c.authorities.values_mut() {
             authority.primary.primary_to_primary = address;
         }
-        let path = format!(".db_test_grbc_retry_kind_{}", std::process::id());
-        let mut store = Store::new(&path).unwrap();
+        let mut store = crate::common::fresh_store("grbc_retry_kind");
         // Grade metadata is not proof that all payload bytes are present.
         store.write(grade_one_key(&digest), vec![1]).await;
         let (tx_sync, rx_sync) = channel(10);
@@ -148,12 +147,7 @@ mod tests {
             for authority in c.authorities.values_mut() {
                 authority.primary.primary_to_primary = listener.local_addr().unwrap();
             }
-            let mut store = Store::new(&format!(
-                ".db_test_grbc_shared_dependency_{}_{}",
-                weak,
-                std::process::id()
-            ))
-            .unwrap();
+            let mut store = crate::common::fresh_store(&format!("grbc_shared_dependency_{}", weak));
             let (tx_sync, rx_sync) = channel(10);
             let (tx_core, mut rx_core) = channel(10);
             HeaderWaiter::spawn(
@@ -277,8 +271,7 @@ mod tests {
 
     #[tokio::test]
     async fn mixed_dependencies_resume_only_after_finish_and_proposal_arrive() {
-        let path = format!(".db_test_grbc_mixed_waiter_{}", std::process::id());
-        let mut store = Store::new(&path).unwrap();
+        let mut store = crate::common::fresh_store("grbc_mixed_waiter");
         let (tx_sync, rx_sync) = channel(10);
         let (tx_core, mut rx_core) = channel(10);
         HeaderWaiter::spawn(

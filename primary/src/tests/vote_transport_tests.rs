@@ -39,10 +39,8 @@ async fn dependency_repair_with_local_payload_does_not_download_it_again() {
     p.header.signature = Signature::new(&p.header.id, &keys().pop().unwrap().1);
     p.verify(&committee()).unwrap();
     let digest = p.block().digest();
-    let mut local =
-        Store::new(&format!(".db_test_vote_only_local_{}", std::process::id())).unwrap();
-    let mut remote =
-        Store::new(&format!(".db_test_vote_only_remote_{}", std::process::id())).unwrap();
+    let mut local = crate::common::fresh_store("vote_only_local");
+    let mut remote = crate::common::fresh_store("vote_only_remote");
     store_verified_proposal(&mut local, p.clone())
         .await
         .unwrap();

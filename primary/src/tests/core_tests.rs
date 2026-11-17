@@ -23,8 +23,7 @@ impl Harness {
 
     fn with_committee(label: &str, node: usize, c: Committee) -> Self {
         let (name, secret) = keys().remove(node);
-        let path = format!(".db_test_grbc_{}_{}_{}", label, node, std::process::id());
-        let store = Store::new(&path).unwrap();
+        let store = crate::common::fresh_store(&format!("grbc_{}_{}", label, node));
         let (tx_headers, headers) = channel(100);
         let sync = Synchronizer::new(&c, store.clone(), tx_headers);
         let (tx_events, events) = channel(100);
@@ -68,7 +67,7 @@ impl Harness {
                 grade_one_certificates: HashMap::new(),
                 completed: HashSet::new(),
                 round_advance_pending: HashMap::new(),
-                weak_edge_candidates: HashMap::new(),
+                weak_edge_candidates: BTreeSet::new(),
                 network: ReliableSender::new(),
                 cancel_handlers: HashMap::new(),
             },
@@ -1532,27 +1531,411 @@ async fn virtual_metadata_recovers_without_requiring_a_local_ready_grade() {
 async fn round_advance_respects_orca_a_weak_edge_limit_and_keeps_backlog() {
     let mut h = Harness::new("orca_a_weak_limit", 0);
     for value in 40..43 {
-        h.core.weak_edge_candidates.insert(Digest([value; 32]), 0);
+        h.core
+            .weak_edge_candidates
+            .insert((0, h.core.name, Digest([value; 32])));
     }
     for header in crate::common::headers().into_iter().take(3) {
-        h.core
-            .try_advance_completed(Certificate {
-                header,
-                votes: Vec::new(),
-            })
-            .await
-            .unwrap();
+        let block = Certificate {
+            header,
+            votes: Vec::new(),
+        };
+        h.core.record_completed(&block).await.unwrap();
+        h.core.try_advance_completed(block).await.unwrap();
     }
     let (parents, weak, virtual_edges, round) = h._parents.recv().await.unwrap();
     assert_eq!(round, 1);
     assert_eq!(parents.len(), 3);
     assert_eq!(weak.len(), 1);
     assert!(virtual_edges.is_empty());
-    assert_eq!(h.core.weak_edge_candidates.len(), 2);
-    assert!(!h.core.weak_edge_candidates.contains_key(&weak[0]));
+    assert_eq!(h.core.weak_edge_candidates.len(), 3);
+    assert_eq!(weak, vec![Digest([40; 32])]);
     assert!(matches!(
         h.events.recv().await.unwrap(),
         ConsensusMessage::RoundAdvanced(2)
     ));
     assert!(h.grades().is_empty());
+}
+
+async fn finish_weak_history_round(
+    h: &mut Harness,
+    round: Round,
+    parents: &std::collections::BTreeSet<Digest>,
+    weak: &std::collections::BTreeSet<Digest>,
+    count: usize,
+) -> (Vec<Certificate>, ProposerMessage) {
+    let mut blocks = Vec::new();
+    for (author, secret) in keys().into_iter().take(count) {
+        let mut header = Header {
+            author,
+            round,
+            parents: parents.clone(),
+            weak_edges: weak.clone(),
+            ..Header::default()
+        };
+        header.id = header.digest();
+        header.signature = Signature::new(&header.id, &secret);
+        let p = Proposal {
+            header,
+            batches: BTreeMap::new(),
+        };
+        h.core.process_proposal(p.clone()).await.unwrap();
+        for vote in votes(&p.header, GrbcPhase::Ready)
+            .into_iter()
+            .skip(1)
+            .take(2)
+        {
+            h.core.process_grbc_vote(vote).await.unwrap();
+        }
+        assert!(h.core.completed.contains(&p.header.id));
+        blocks.push(p.block());
+    }
+    h.grades();
+    h.outgoing();
+    let notification = h._parents.try_recv().unwrap();
+    assert!(h._parents.try_recv().is_err());
+    (blocks, notification)
+}
+
+#[tokio::test]
+async fn weak_selection_excludes_history_already_covered_through_weak_ancestors() {
+    let mut h = Harness::new("weak_covered_ancestor", 0);
+    let genesis = Certificate::genesis(&committee())
+        .iter()
+        .map(Certificate::digest)
+        .collect();
+    let (first, _) = finish_weak_history_round(&mut h, 1, &genesis, &Default::default(), 3).await;
+    let strong = first.iter().map(Certificate::digest).collect();
+    let (second, _) = finish_weak_history_round(&mut h, 2, &strong, &Default::default(), 3).await;
+    // This orphan completes after the earlier parent snapshot was sent.
+    let orphan = proposal();
+    h.core.process_proposal(orphan.clone()).await.unwrap();
+    for vote in votes(&orphan.header, GrbcPhase::Ready)
+        .into_iter()
+        .skip(1)
+        .take(2)
+    {
+        h.core.process_grbc_vote(vote).await.unwrap();
+    }
+    let strong = second.iter().map(Certificate::digest).collect();
+    let weak = [orphan.block().digest()].iter().cloned().collect();
+    let (_, notification) = finish_weak_history_round(&mut h, 3, &strong, &weak, 3).await;
+    assert!(
+        notification.1.is_empty(),
+        "a transitively covered vertex must not consume a weak-edge slot"
+    );
+}
+
+#[tokio::test]
+async fn weak_selection_keeps_unoutput_candidates_across_superseded_notifications() {
+    let mut h = Harness::new("weak_superseded_notification", 0);
+    let genesis = Certificate::genesis(&committee())
+        .iter()
+        .map(Certificate::digest)
+        .collect();
+    let (first, _) = finish_weak_history_round(&mut h, 1, &genesis, &Default::default(), 4).await;
+    let orphan = first[3].digest();
+    let mut parents = first[..3].iter().map(Certificate::digest).collect();
+    for round in 2..=3 {
+        let (blocks, notification) =
+            finish_weak_history_round(&mut h, round, &parents, &Default::default(), 3).await;
+        assert_eq!(
+            notification.1,
+            vec![orphan.clone()],
+            "sending a parent snapshot does not prove its weak edge was proposed or output"
+        );
+        // Model a local proposer that received the next notification before it
+        // created a header. Other replicas can advance without that proposal.
+        parents = blocks.iter().map(Certificate::digest).collect();
+    }
+}
+
+#[tokio::test]
+async fn weak_selection_survives_gc_until_exact_output_feedback() {
+    let mut h = Harness::new("weak_gc_retention", 0);
+    h.core.gc_depth = 2;
+    let genesis = Certificate::genesis(&committee())
+        .iter()
+        .map(Certificate::digest)
+        .collect();
+    let mut parents = genesis;
+    for round in 1..=3 {
+        let (blocks, _) =
+            finish_weak_history_round(&mut h, round, &parents, &Default::default(), 3).await;
+        h.core.process_committed(blocks.clone()).await.unwrap();
+        h.cleanup.try_recv().unwrap();
+        parents = blocks.iter().map(Certificate::digest).collect();
+    }
+    let old = proposal();
+    h.core.process_proposal(old.clone()).await.unwrap();
+    for vote in votes(&old.header, GrbcPhase::Ready)
+        .into_iter()
+        .skip(1)
+        .take(2)
+    {
+        h.core.process_grbc_vote(vote).await.unwrap();
+    }
+    let orphan = old.block();
+    h.core.consensus_round.store(5, Ordering::Relaxed);
+    h.core.cleanup();
+    assert!(!h.core.proposal_headers.contains_key(&orphan.header.id));
+    let (blocks, notification) =
+        finish_weak_history_round(&mut h, 4, &parents, &Default::default(), 3).await;
+    assert!(
+        notification.1.contains(&orphan.digest()),
+        "an old unoutput vertex must survive candidate GC"
+    );
+    h.core
+        .process_committed(vec![orphan.clone()])
+        .await
+        .unwrap();
+    parents = blocks.iter().map(Certificate::digest).collect();
+    let (_, notification) =
+        finish_weak_history_round(&mut h, 5, &parents, &Default::default(), 3).await;
+    assert!(
+        !notification.1.contains(&orphan.digest()),
+        "exact output retires the candidate"
+    );
+}
+
+#[tokio::test]
+async fn weak_selection_failure_preserves_the_quorum_notification_for_retry() {
+    let mut h = Harness::new("weak_selection_retry", 0);
+    let blocks: Vec<_> = crate::common::headers()
+        .into_iter()
+        .map(|header| Certificate {
+            header,
+            votes: vec![],
+        })
+        .collect();
+    h.core
+        .weak_edge_candidates
+        .insert((0, h.core.name, Digest([40; 32])));
+    // Model an unavailable completion record. Strong dependencies (genesis)
+    // are present, but selection must not guess the missing parent's history.
+    for block in &blocks[..2] {
+        h.core.record_completed(block).await.unwrap();
+        h.core.try_advance_completed(block.clone()).await.unwrap();
+    }
+    assert!(h
+        .core
+        .try_advance_completed(blocks[2].clone())
+        .await
+        .is_err());
+    assert!(h._parents.try_recv().is_err());
+    h.core
+        .store
+        .write(
+            blocks[2].digest().to_vec(),
+            bincode::serialize(&blocks[0]).unwrap(),
+        )
+        .await;
+    assert!(h.core.retry_round_advance_pending().await.is_err());
+    assert!(h._parents.try_recv().is_err());
+    h.core.record_completed(&blocks[2]).await.unwrap();
+    h.core.retry_round_advance_pending().await.unwrap();
+    let notification = h
+        ._parents
+        .try_recv()
+        .expect("selection failure must not consume the quorum");
+    assert_eq!(notification.0.len(), 3);
+    assert_eq!(notification.3, 1);
+    // Further completion/retry must not produce a second notification.
+    h.core.record_completed(&blocks[3]).await.unwrap();
+    h.core
+        .try_advance_completed(blocks[3].clone())
+        .await
+        .unwrap();
+    h.core.retry_round_advance_pending().await.unwrap();
+    assert!(h._parents.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn weak_selection_uses_public_order_independently_of_arrival() {
+    let mut h = Harness::new("weak_public_order", 0);
+    // Synthetic candidate IDs isolate the public ordering contract. Selection
+    // reads causal parents, not candidate bodies; Core admission is tested above.
+    let entries = vec![
+        (2, PublicKey([0; 32]), Digest([20; 32])),
+        (1, PublicKey([2; 32]), Digest([12; 32])),
+        (1, PublicKey([1; 32]), Digest([11; 32])),
+        (1, PublicKey([0; 32]), Digest([10; 32])),
+        (3, PublicKey([0; 32]), Digest([30; 32])),
+    ];
+    for reverse in [false, true] {
+        let mut arrival = entries.clone();
+        if reverse {
+            arrival.reverse();
+        }
+        let candidates = arrival.into_iter().collect();
+        let selected = h
+            .core
+            .synchronizer
+            .select_weak_parents(3, &[], &candidates, 4, &HashMap::new(), &HashSet::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            selected,
+            vec![
+                Digest([10; 32]),
+                Digest([11; 32]),
+                Digest([12; 32]),
+                Digest([20; 32])
+            ]
+        );
+        let limited = h
+            .core
+            .synchronizer
+            .select_weak_parents(3, &[], &candidates, 2, &HashMap::new(), &HashSet::new())
+            .await
+            .unwrap();
+        assert_eq!(limited, vec![Digest([10; 32]), Digest([11; 32])]);
+    }
+}
+
+#[tokio::test]
+async fn weak_selection_ignores_virtual_coverage_after_metadata_gc() {
+    let mut h = Harness::new("weak_virtual_gc", 0);
+    let genesis = Certificate::genesis(&committee())
+        .iter()
+        .map(Certificate::digest)
+        .collect();
+    let (first, _) = finish_weak_history_round(&mut h, 1, &genesis, &Default::default(), 4).await;
+    let strong = first[..3].iter().map(Certificate::digest).collect();
+    let (second, _) = finish_weak_history_round(&mut h, 2, &strong, &Default::default(), 3).await;
+    let mut carrier = proposal();
+    carrier.header.round = 2;
+    carrier.header.parents = strong;
+    carrier.header.virtual_edges.insert(first[3].digest());
+    resign(&mut carrier);
+    h.core.process_proposal(carrier.clone()).await.unwrap();
+    for vote in votes(&carrier.header, GrbcPhase::Ready)
+        .into_iter()
+        .skip(1)
+        .take(2)
+    {
+        h.core.process_grbc_vote(vote).await.unwrap();
+    }
+    assert!(h.core.completed.contains(&carrier.header.id));
+    h.core.gc_depth = 1;
+    h.core.consensus_round.store(4, Ordering::Relaxed);
+    h.core.cleanup();
+    assert!(h.core.grade_one_certificates.is_empty());
+    let parents = [
+        second[0].digest(),
+        second[1].digest(),
+        carrier.block().digest(),
+    ]
+    .iter()
+    .cloned()
+    .collect();
+    let (_, notification) =
+        finish_weak_history_round(&mut h, 3, &parents, &Default::default(), 3).await;
+    assert_eq!(
+        notification.1,
+        vec![first[3].digest()],
+        "virtual-only ancestry must not suppress weak coverage"
+    );
+}
+
+#[tokio::test]
+#[ignore = "manual weak-history backlog cost measurement"]
+async fn weak_history_backlog_benchmark() {
+    let mut h = Harness::new("weak_history_backlog", 0);
+    h.core.gc_depth = 5;
+    let genesis = Certificate::genesis(&committee())
+        .iter()
+        .map(Certificate::digest)
+        .collect();
+    let (first, _) = finish_weak_history_round(&mut h, 1, &genesis, &Default::default(), 4).await;
+    let orphan = first[3].digest();
+    h.core.process_committed(first[..3].to_vec()).await.unwrap();
+    h.cleanup.try_recv().unwrap();
+    while h._headers.try_recv().is_ok() {}
+    let mut parents = first[..3].iter().map(Certificate::digest).collect();
+    let mut start = Instant::now();
+    let mut previous = 1;
+    for round in 2..=401 {
+        // The proposer notifications are superseded while the other three
+        // authorities extend/output a history that does not include the orphan.
+        let (blocks, notification) =
+            finish_weak_history_round(&mut h, round, &parents, &Default::default(), 3).await;
+        assert_eq!(notification.1, vec![orphan.clone()]);
+        h.core.process_committed(blocks.clone()).await.unwrap();
+        h.cleanup.try_recv().unwrap();
+        while h._headers.try_recv().is_ok() {}
+        h.core.consensus_round.store(round, Ordering::Relaxed);
+        h.core.cleanup();
+        parents = blocks.iter().map(Certificate::digest).collect();
+        if [51, 101, 201, 401].contains(&round) {
+            eprintln!(
+                "weak_backlog rounds={}..{} elapsed_ms={:.3} retained_candidates={}",
+                previous + 1,
+                round,
+                start.elapsed().as_secs_f64() * 1000.0,
+                h.core.weak_edge_candidates.len()
+            );
+            previous = round;
+            start = Instant::now();
+        }
+    }
+}
+
+#[tokio::test]
+async fn weak_selection_stops_at_output_frontier_without_reading_old_ancestors() {
+    let mut h = Harness::new("weak_output_frontier", 0);
+    let genesis = Certificate::genesis(&committee())
+        .iter()
+        .map(Certificate::digest)
+        .collect();
+    let (first, _) = finish_weak_history_round(&mut h, 1, &genesis, &Default::default(), 4).await;
+    h.core.process_committed(first[..3].to_vec()).await.unwrap();
+    h.cleanup.try_recv().unwrap();
+    let parents = first[..3].iter().map(Certificate::digest).collect();
+    let (second, _) = finish_weak_history_round(&mut h, 2, &parents, &Default::default(), 3).await;
+    h.core.process_committed(second.clone()).await.unwrap();
+    assert_eq!(h.core.weak_edge_candidates.len(), 1);
+    // Only the output frontier is available in this store. Traversing beyond
+    // it is unnecessary: output already includes its strong/weak ancestors.
+    let mut store = crate::common::fresh_store("grbc_weak_frontier");
+    for block in &second {
+        store
+            .write(block.digest().to_vec(), bincode::serialize(block).unwrap())
+            .await;
+    }
+    let (tx, _rx) = channel(10);
+    let mut sync = Synchronizer::new(&committee(), store, tx);
+    let roots: Vec<_> = second.iter().map(Certificate::digest).collect();
+    let weak = sync
+        .select_weak_parents(
+            2,
+            &roots,
+            &h.core.weak_edge_candidates,
+            1,
+            &HashMap::new(),
+            &HashSet::new(),
+        )
+        .await
+        .expect("exact output is a causal traversal frontier");
+    assert_eq!(weak, vec![first[3].digest()]);
+}
+
+#[tokio::test]
+async fn weak_selection_does_not_treat_ready_only_as_output() {
+    let mut h = Harness::new("weak_ready_not_output", 0);
+    let block = proposal().block();
+    let roots = vec![block.digest()];
+    let ready = [(block.digest(), block)].iter().cloned().collect();
+    let candidates = [(0, h.core.name, Digest([40; 32]))]
+        .iter()
+        .cloned()
+        .collect();
+    assert!(
+        h.core
+            .synchronizer
+            .select_weak_parents(1, &roots, &candidates, 1, &ready, &HashSet::new(),)
+            .await
+            .is_err(),
+        "READY without a completion record does not prove output"
+    );
 }

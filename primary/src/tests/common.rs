@@ -6,6 +6,20 @@ use crypto::{generate_keypair, PublicKey, SecretKey, Signature};
 use rand::rngs::StdRng;
 use rand::SeedableRng as _;
 
+/// A PID can be reused while earlier test databases still exist. Reserve a
+/// fresh directory atomically so repeated fixtures never inherit completion
+/// records (or contend for the same RocksDB lock).
+pub fn fresh_store(label: &str) -> store::Store {
+    loop {
+        let path = format!(".db_test_{}_{}", label, rand::random::<u128>());
+        match std::fs::create_dir(&path) {
+            Ok(()) => return store::Store::new(&path).unwrap(),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => panic!("Failed to create test store {}: {}", path, error),
+        }
+    }
+}
+
 impl PartialEq for GrbcVote {
     fn eq(&self, other: &Self) -> bool {
         self.digest() == other.digest()
