@@ -79,6 +79,8 @@ impl Primary {
         tx_consensus: Sender<ConsensusMessage>,
         mut rx_consensus: Receiver<ConsensusCommand>,
     ) {
+        crate::adversary::initialize(keypair.name, &committee)
+            .expect("Invalid BENCH_ADVERSARY_CONFIG");
         let (tx_others_digests, rx_others_digests) = channel(CHANNEL_CAPACITY);
         let (tx_our_digests, rx_our_digests) = channel(CHANNEL_CAPACITY);
         let (tx_parents, rx_parents) = channel(CHANNEL_CAPACITY);
