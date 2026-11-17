@@ -658,6 +658,7 @@ dependencies = [
  "network",
  "rand",
  "serde",
+ "serde_json",
  "store",
  "thiserror",
  "tokio",
