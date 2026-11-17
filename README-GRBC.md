@@ -190,3 +190,14 @@ and serialization of adjacent complete-proposal repairs. It is not included
 here: its measured latency/throughput tradeoff remains inconclusive. Thread
 defaults, fabric parameters, quorum rules and the serial startup procedure
 remain unchanged.
+
+### Independent weak-history candidate — 2026-11-17
+
+The `orca-a-weak-history-selection` branch corrects deterministic weak-parent
+selection, candidate retention across superseded notifications/GC, and causal
+coverage filtering. It reuses completion state to stop traversal at actual
+output frontiers and retains a quorum if selection must retry. See
+[the candidate's validation and scope](docs/experiments/weak-history-2026-11-17.md).
+This candidate is separate from the recommended `orca-a-grbc-echo-ready` at
+bf69ba4; local correctness evidence does not establish the requested WAN
+throughput and latency improvement.

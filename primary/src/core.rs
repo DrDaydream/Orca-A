@@ -18,7 +18,7 @@ use crypto::Hash as _;
 use crypto::{Digest, PublicKey, SignatureService, SignatureVerifier};
 use log::{debug, error, warn};
 use network::{CancelHandler, ReliableSender};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -92,8 +92,9 @@ pub struct Core {
     /// Header IDs whose broadcast no longer needs local processing.
     completed: HashSet<Digest>,
     round_advance_pending: HashMap<Digest, Certificate>,
-    /// Completed blocks not yet referenced by a weak edge.
-    weak_edge_candidates: HashMap<Digest, Round>,
+    /// FINISH vertices awaiting exact output, in public (round, author, digest)
+    /// order. A parent notification alone does not prove eventual inclusion.
+    weak_edge_candidates: BTreeSet<(Round, PublicKey, Digest)>,
     /// Sender only for small synchronization requests.
     network: ReliableSender,
     /// Keeps the cancel handlers of the messages we sent.
@@ -157,7 +158,7 @@ impl Core {
                 grade_one_certificates: HashMap::new(),
                 completed: HashSet::new(),
                 round_advance_pending: HashMap::new(),
-                weak_edge_candidates: HashMap::new(),
+                weak_edge_candidates: BTreeSet::new(),
                 network: ReliableSender::new(),
                 cancel_handlers: HashMap::with_capacity(2 * gc_depth as usize),
             }
@@ -331,6 +332,8 @@ impl Core {
                 }
             }
             notifications.push((digest.clone(), header.id.clone()));
+            self.weak_edge_candidates
+                .remove(&(block.round(), block.origin(), digest.clone()));
             // Old committed history still releases disk-backed dependencies,
             // but must not repopulate state below an unchanged GC boundary.
             if header.round < self.gc_round {
@@ -638,6 +641,10 @@ impl Core {
         }
         self.deliver_grade_one(&block.header).await?;
         if self.record_completed(&block).await? {
+            // Every non-output completion must register before selection: the
+            // selector infers output from COMPLETE records absent from this set.
+            self.weak_edge_candidates
+                .insert((block.round(), block.origin(), block.digest()));
             debug!("GRBC grade 2 delivered for {:?}", block);
             self.tx_consensus
                 .send(ConsensusMessage::GradeTwo(block.clone()))
@@ -676,7 +683,6 @@ impl Core {
             .await;
         if block.round() >= self.gc_round {
             self.completed.insert(block.header.id.clone());
-            self.weak_edge_candidates.insert(digest, block.round());
         }
         Ok(true)
     }
@@ -691,14 +697,32 @@ impl Core {
                 .insert(certificate.digest(), certificate);
             return Ok(());
         }
-        self.round_advance_pending.remove(&certificate.digest());
-        if let Some(parents) = self
+        let aggregator = self
             .certificates_aggregators
             .entry(certificate.round())
-            .or_insert_with(|| Box::new(CertificatesAggregator::new()))
-            .append(certificate.clone(), &self.committee)?
-        {
+            .or_insert_with(|| Box::new(CertificatesAggregator::new()));
+        if let Some(parents) = aggregator.append(&certificate, &self.committee) {
             let round = certificate.round();
+            let weak_edges = match self
+                .synchronizer
+                .select_weak_parents(
+                    round,
+                    parents,
+                    &self.weak_edge_candidates,
+                    self.committee.size().saturating_sub(1) / 3,
+                    &self.grade_one_certificates,
+                    &self.completed,
+                )
+                .await
+            {
+                Ok(edges) => edges,
+                Err(error) => {
+                    self.round_advance_pending
+                        .insert(certificate.digest(), certificate);
+                    return Err(error);
+                }
+            };
+            let parents = aggregator.take_parents();
             let virtual_edges = self
                 .grade_one_certificates
                 .iter()
@@ -707,19 +731,6 @@ impl Core {
                 })
                 .map(|(digest, _)| digest.clone())
                 .collect();
-            let weak_edges: Vec<_> = self
-                .weak_edge_candidates
-                .iter()
-                .filter(|(_, block_round)| **block_round < round)
-                .take(self.committee.size().saturating_sub(1) / 3)
-                .map(|(digest, _)| digest.clone())
-                .collect();
-            for digest in &parents {
-                self.weak_edge_candidates.remove(digest);
-            }
-            for digest in &weak_edges {
-                self.weak_edge_candidates.remove(digest);
-            }
             self.tx_consensus
                 .send(ConsensusMessage::RoundAdvanced(round + 1))
                 .await
@@ -729,6 +740,7 @@ impl Core {
                 .await
                 .expect("Failed to send GRBC edges to proposer");
         }
+        self.round_advance_pending.remove(&certificate.digest());
         Ok(())
     }
 
@@ -872,8 +884,8 @@ impl Core {
             .retain(|_, c| c.round() >= gc_round);
         self.round_advance_pending
             .retain(|_, c| c.round() >= gc_round);
-        self.weak_edge_candidates
-            .retain(|_, round| *round >= gc_round);
+        // Age does not establish output or causal coverage. Unoutput weak
+        // candidates remain eligible; completion metadata is retained on disk.
         self.cancel_handlers.retain(|round, _| *round >= gc_round);
         self.gc_round = gc_round;
     }

@@ -69,22 +69,26 @@ impl CertificatesAggregator {
 
     pub fn append(
         &mut self,
-        certificate: Certificate,
+        certificate: &Certificate,
         committee: &Committee,
-    ) -> DagResult<Option<Vec<Digest>>> {
+    ) -> Option<&[Digest]> {
         let origin = certificate.origin();
 
-        // Ensure it is the first time this authority votes.
-        if !self.used.insert(origin) {
-            return Ok(None);
+        if self.used.insert(origin) {
+            self.certificates.push(certificate.digest());
+            self.weight += committee.stake(&origin);
         }
-
-        self.certificates.push(certificate.digest());
-        self.weight += committee.stake(&origin);
         if self.weight >= committee.quorum_threshold() {
-            self.weight = 0; // Ensures quorum is only reached once.
-            return Ok(Some(self.certificates.drain(..).collect()));
+            Some(&self.certificates)
+        } else {
+            None
         }
-        Ok(None)
+    }
+
+    /// Consume only after edge selection succeeds, allowing a failed history
+    /// read to retry the same quorum without recounting any authority.
+    pub fn take_parents(&mut self) -> Vec<Digest> {
+        self.weight = 0;
+        std::mem::take(&mut self.certificates)
     }
 }

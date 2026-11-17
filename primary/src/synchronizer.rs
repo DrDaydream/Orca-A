@@ -1,11 +1,12 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-use crate::error::DagResult;
+use crate::error::{DagError, DagResult};
 use crate::header_waiter::WaiterMessage;
 use crate::messages::{proposal_header_key, Certificate, Header};
+use crate::primary::Round;
 use config::Committee;
-use crypto::Digest;
 use crypto::Hash as _;
-use std::collections::{HashMap, HashSet};
+use crypto::{Digest, PublicKey};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use store::Store;
 use tokio::sync::mpsc::Sender;
 
@@ -149,5 +150,73 @@ impl Synchronizer {
                 .await
                 .expect("Failed to clear committed dependency requests");
         }
+    }
+
+    /// Fill the weak-edge budget with old, not-yet-output vertices absent from
+    /// this parent snapshot's causal history. Never follow virtual evidence.
+    pub async fn select_weak_parents(
+        &mut self,
+        parent_round: Round,
+        parents: &[Digest],
+        candidates: &BTreeSet<(Round, PublicKey, Digest)>,
+        limit: usize,
+        ready: &HashMap<Digest, Certificate>,
+        completed: &HashSet<Digest>,
+    ) -> DagResult<Vec<Digest>> {
+        let oldest = match candidates.iter().next() {
+            Some((round, _, _)) if *round < parent_round && limit > 0 => *round,
+            _ => return Ok(Vec::new()),
+        };
+        let mut covered = HashSet::new();
+        let mut pending = parents.to_vec();
+        while let Some(digest) = pending.pop() {
+            if !covered.insert(digest.clone()) {
+                continue;
+            }
+            // Borrow the usual hot-path metadata. The disk fallback is only
+            // needed after metadata GC or consensus completion without READY.
+            let stored;
+            let certificate = if let Some(certificate) = ready
+                .get(&digest)
+                .filter(|c| completed.contains(&c.header.id))
+            {
+                certificate
+            } else if let Some((_, genesis)) = self.genesis.iter().find(|(id, _)| id == &digest) {
+                genesis
+            } else {
+                let bytes = self
+                    .store
+                    .read(digest.to_vec())
+                    .await?
+                    .ok_or_else(|| DagError::MalformedHeader(digest.clone()))?;
+                stored = bincode::deserialize::<Certificate>(&bytes)?;
+                ensure!(stored.digest() == digest, DagError::MalformedHeader(digest));
+                &stored
+            };
+            // Every non-output completion registers a candidate; only exact
+            // output removes one, including across GC. A COMPLETE vertex absent
+            // from candidates is therefore an output frontier: its strong/weak
+            // ancestors cannot contain an unoutput candidate. READY alone must
+            // never supply this inference. No second output ledger is needed.
+            if certificate.round() > oldest
+                && candidates.contains(&(certificate.round(), certificate.origin(), digest))
+            {
+                pending.extend(
+                    certificate
+                        .header
+                        .parents
+                        .iter()
+                        .chain(&certificate.header.weak_edges)
+                        .cloned(),
+                );
+            }
+        }
+        Ok(candidates
+            .iter()
+            .take_while(|(round, _, _)| *round < parent_round)
+            .filter(|(_, _, digest)| !covered.contains(digest))
+            .take(limit)
+            .map(|(_, _, digest)| digest.clone())
+            .collect())
     }
 }
