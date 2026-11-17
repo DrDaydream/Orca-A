@@ -23,6 +23,182 @@ fn keys() -> Vec<(PublicKey, SecretKey)> {
     (0..4).map(|_| generate_keypair(&mut rng)).collect()
 }
 
+// Exercise the real consensus indexes with three rounds in flight and a
+// steadily released prefix. Keeping source headers for GC must not keep
+// copying support for every target since genesis into each new round.
+fn advancing_strong_history(rounds: Round) -> (State, Vec<Certificate>, Vec<f64>) {
+    let committee = mock_committee();
+    let genesis = Certificate::genesis(&committee);
+    let mut parents: BTreeSet<_> = genesis.iter().map(Certificate::digest).collect();
+    let mut state = State::new(genesis);
+    let authorities: Vec<_> = keys().iter().map(|(public, _)| *public).collect();
+    let mut pending = VecDeque::new();
+    let mut elapsed = Vec::new();
+    let mut latest = Vec::new();
+    for round in 1..=rounds {
+        let start = std::time::Instant::now();
+        let current: Vec<_> = authorities
+            .iter()
+            .map(|author| mock_certificate(*author, round, parents.clone()).1)
+            .collect();
+        for block in &current {
+            state.observe(block.clone());
+            state.promote_to_dag(block.clone());
+        }
+        parents = current.iter().map(Certificate::digest).collect();
+        pending.push_back(current.clone());
+        if pending.len() > 3 {
+            let output = pending.pop_front().unwrap();
+            state.finalized_round = output[0].round();
+            state.committed_leaders.insert(state.finalized_round);
+            state.update(&output, 50);
+        }
+        latest = current;
+        elapsed.push(start.elapsed().as_secs_f64() * 1000.0);
+    }
+    (state, latest, elapsed)
+}
+
+#[test]
+fn finalized_strong_targets_do_not_accumulate_with_released_history() {
+    let (state, latest, _) = advancing_strong_history(120);
+    assert_eq!(state.finalized_round, 117);
+    let ancestor_entries: usize = state.strong_ancestors.values().map(HashSet::len).sum();
+    let observed_entries = state.observed_strong_support.len();
+    let dag_entries = state.dag_strong_support.len();
+    eprintln!(
+        "strong_frontier ancestor_entries={} observed_support={} dag_support={}",
+        ancestor_entries, observed_entries, dag_entries
+    );
+    // Four authors and three in-flight rounds require at most 4*4*3*3
+    // ancestor entries, independent of the number of released rounds.
+    assert!(
+        ancestor_entries <= 144,
+        "released ancestors keep accumulating"
+    );
+    assert!(observed_entries <= 36 && dag_entries <= 36);
+    let live_target = state.observed_by_round[&118].values().next().unwrap();
+    assert_eq!(
+        state.observed_strong_support[&(120, live_target.clone())].len(),
+        4
+    );
+    assert_eq!(
+        state.dag_strong_support[&(120, live_target.clone())].len(),
+        4
+    );
+    assert!(latest
+        .iter()
+        .all(|block| state.strong_ancestors[&block.digest()].contains(live_target)));
+}
+
+#[test]
+fn strong_frontier_keeps_unknown_and_known_unresolved_targets() {
+    let mut state = State::new(Certificate::genesis(&mock_committee()));
+    let authors: Vec<_> = keys().iter().map(|(public, _)| *public).collect();
+    let (target_digest, target) = mock_certificate(authors[0], 2, BTreeSet::new());
+    let (unknown_digest, unknown) = mock_certificate(authors[1], 2, BTreeSet::new());
+    state.observe(target);
+    state.finalized_round = 1;
+    // Known round information takes precedence over an exact-output marker.
+    // Neither a watermark nor a marker may retire a target above the prefix.
+    state.ordered_digests.insert(target_digest.clone());
+    let (child_digest, child) = mock_certificate(
+        authors[2],
+        3,
+        [target_digest.clone(), unknown_digest.clone()]
+            .iter()
+            .cloned()
+            .collect(),
+    );
+    state.observe(child.clone());
+    state.promote_to_dag(child);
+    state.update(&[], 50);
+    for target in [&target_digest, &unknown_digest] {
+        assert!(state.strong_ancestors[&child_digest].contains(target));
+        assert!(state.observed_strong_support[&(3, target.clone())].contains(&authors[2]));
+        assert!(state.dag_strong_support[&(3, target.clone())].contains(&authors[2]));
+    }
+    assert!(state.observe(unknown).contains(&2));
+}
+
+#[test]
+fn strong_frontier_does_not_reinsert_an_ordered_endpoint_after_header_gc() {
+    let mut state = State::new(Certificate::genesis(&mock_committee()));
+    let authors: Vec<_> = keys().iter().map(|(public, _)| *public).collect();
+    let (old_digest, old) = mock_certificate(authors[0], 1, BTreeSet::new());
+    state.observe(old.clone());
+    state.promote_to_dag(old.clone());
+    state.finalized_round = 1;
+    state.update(&[old], 2);
+    let (_, recent) = mock_certificate(authors[0], 4, BTreeSet::new());
+    state.observe(recent.clone());
+    state.promote_to_dag(recent.clone());
+    state.finalized_round = 4;
+    state.update(&[recent], 2);
+    assert!(!state.observed.contains_key(&old_digest));
+    assert!(state.ordered_digests.contains(&old_digest));
+    // A late round-2 child still has its valid direct strong edge to round 1.
+    let (child_digest, child) = mock_certificate(
+        authors[1],
+        2,
+        [old_digest.clone()].iter().cloned().collect(),
+    );
+    state.observe(child.clone());
+    state.promote_to_dag(child);
+    assert!(!state.strong_ancestors[&child_digest].contains(&old_digest));
+    assert!(!state
+        .observed_strong_support
+        .contains_key(&(2, old_digest.clone())));
+    assert!(!state
+        .dag_strong_support
+        .contains_key(&(2, old_digest.clone())));
+    // Header/causal storage and reverse edges are separate obligations.
+    assert!(state.dag_by_digest[&child_digest]
+        .header
+        .parents
+        .contains(&old_digest));
+    assert!(state.strong_children[&old_digest].contains(&child_digest));
+}
+
+#[test]
+fn strong_frontier_promotion_ignores_targets_released_only_by_skips() {
+    let mut state = State::new(Certificate::genesis(&mock_committee()));
+    let authors: Vec<_> = keys().iter().map(|(public, _)| *public).collect();
+    let (target_digest, target) = mock_certificate(authors[0], 1, BTreeSet::new());
+    state.observe(target);
+    let (child_digest, child) = mock_certificate(
+        authors[1],
+        2,
+        [target_digest.clone()].iter().cloned().collect(),
+    );
+    state.observe(child.clone());
+    assert!(state.strong_ancestors[&child_digest].contains(&target_digest));
+    state.skipped_leaders.insert(1);
+    state.finalized_round = 1;
+    // No output/update has cleaned the previously indexed path yet.
+    state.promote_to_dag(child);
+    assert!(!state
+        .dag_strong_support
+        .contains_key(&(2, target_digest.clone())));
+    assert!(state.dag_by_digest[&child_digest]
+        .header
+        .parents
+        .contains(&target_digest));
+}
+
+#[test]
+#[ignore = "manual consensus strong-history scaling measurement"]
+fn finalized_strong_history_benchmark() {
+    let (state, _, elapsed) = advancing_strong_history(400);
+    let first: f64 = elapsed[..100].iter().sum();
+    let last: f64 = elapsed[300..].iter().sum();
+    eprintln!(
+        "strong_history rounds=400 first100_ms={:.3} last100_ms={:.3} ancestor_entries={} observed_support={} dag_support={}",
+        first, last, state.strong_ancestors.values().map(HashSet::len).sum::<usize>(),
+        state.observed_strong_support.len(), state.dag_strong_support.len()
+    );
+}
+
 // Fixture
 pub fn mock_committee() -> Committee {
     Committee {

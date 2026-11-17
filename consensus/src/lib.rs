@@ -77,8 +77,9 @@ struct State {
     observed: HashMap<Digest, Certificate>,
     /// O(1) lookup for an observed block selected by round and author.
     observed_by_round: HashMap<Round, HashMap<PublicKey, Digest>>,
-    /// Incrementally maintained strong-path transitive closure and reverse
-    /// dependency index. New ancestors propagate only to affected children.
+    /// Incrementally maintained strong paths to targets above the released
+    /// leader prefix, plus unknown targets. Reverse dependencies still retain
+    /// intermediate vertices so late live ancestry reaches affected children.
     strong_ancestors: HashMap<Digest, HashSet<Digest>>,
     strong_children: HashMap<Digest, HashSet<Digest>>,
     /// Per-target support sets updated when a new edge/ancestor becomes known.
@@ -459,10 +460,16 @@ impl State {
         let mut pending = vec![(source, additions)];
         let mut dirty = HashSet::new();
         while let Some((digest, candidates)) = pending.pop() {
+            let observed = &self.observed;
+            let ordered = &self.ordered_digests;
+            let finalized = self.finalized_round;
             let ancestors = self.strong_ancestors.entry(digest.clone()).or_default();
             let fresh: HashSet<_> = candidates
                 .into_iter()
-                .filter(|ancestor| ancestors.insert(ancestor.clone()))
+                .filter(|ancestor| {
+                    Self::strong_target_is_pending(ancestor, finalized, observed, ordered)
+                        && ancestors.insert(ancestor.clone())
+                })
                 .collect();
             if fresh.is_empty() {
                 continue;
@@ -494,6 +501,21 @@ impl State {
             }
         }
         dirty
+    }
+
+    /// Strong-support consumers only query unresolved leader rounds. Exact
+    /// output is a fallback for an endpoint whose header has already been GC'd;
+    /// an unknown, never-output endpoint must survive for late evidence.
+    fn strong_target_is_pending(
+        target: &Digest,
+        finalized: Round,
+        observed: &HashMap<Digest, Certificate>,
+        ordered: &HashSet<Digest>,
+    ) -> bool {
+        observed.get(target).map_or_else(
+            || !ordered.contains(target),
+            |block| block.round() > finalized,
+        )
     }
 
     /// Rule 3 accepts verified GRBC data without waiting for grade 1/2. Insert
@@ -630,6 +652,14 @@ impl State {
         }
         if let Some(ancestors) = self.strong_ancestors.get(&digest) {
             for ancestor in ancestors {
+                if !Self::strong_target_is_pending(
+                    ancestor,
+                    self.finalized_round,
+                    &self.observed,
+                    &self.ordered_digests,
+                ) {
+                    continue;
+                }
                 self.dag_strong_support
                     .entry((round, ancestor.clone()))
                     .or_default()
@@ -758,16 +788,25 @@ impl State {
                 || certificate.round() + gc_depth >= last_committed_round
         });
         let observed_digests: HashSet<_> = self.observed.keys().cloned().collect();
-        self.strong_ancestors
-            .retain(|digest, _| observed_digests.contains(digest));
+        let observed = &self.observed;
+        let finalized = self.finalized_round;
+        let target_pending = |target: &Digest| {
+            Self::strong_target_is_pending(target, finalized, observed, ordered_digests)
+        };
+        self.strong_ancestors.retain(|digest, ancestors| {
+            ancestors.retain(&target_pending);
+            observed_digests.contains(digest)
+        });
         self.strong_children.retain(|digest, children| {
             children.retain(|child| observed_digests.contains(child));
             observed_digests.contains(digest) || !children.is_empty()
         });
-        self.observed_strong_support
-            .retain(|(round, _), _| *round + gc_depth >= last_committed_round);
-        self.dag_strong_support
-            .retain(|(round, _), _| *round + gc_depth >= last_committed_round);
+        self.observed_strong_support.retain(|(round, target), _| {
+            *round + gc_depth >= last_committed_round && target_pending(target)
+        });
+        self.dag_strong_support.retain(|(round, target), _| {
+            *round + gc_depth >= last_committed_round && target_pending(target)
+        });
         self.observed_direct_support
             .retain(|(round, _), _| *round + gc_depth >= last_committed_round);
         self.dag_direct_support
@@ -1373,7 +1412,8 @@ impl Consensus {
         )
     }
 
-    /// Strong-path reachability over blocks observed in Dag union VDag.
+    /// Strong-path reachability to an unresolved leader target. Cached targets
+    /// at or below the released leader prefix may already have been removed.
     fn has_strong_path(&self, block: &Certificate, target: &Digest, state: &State) -> bool {
         if let Some(ancestors) = state.strong_ancestors.get(&block.digest()) {
             return ancestors.contains(target);
