@@ -142,6 +142,7 @@ public key in every configured region.
 cp -n settings.example.json settings.json
 # Edit settings.json for your SSH key, AWS regions, and instance type.
 fab info
+fab install
 fab remote
 ```
 
@@ -150,19 +151,25 @@ The example names `DrDaydream/Orca-A`, branch `orca-a-grbc-echo-ready`, and
 AWS access tokens outside the repository. Existing benchmark parameter edits
 in `fabfile.py` are used directly; no command-line parameter changes are needed.
 
-`fab remote` checks build dependencies on the controller and selected Ubuntu
-24.04 x86_64 instances, installs missing Clang 14 and Rust 1.85.0 dependencies,
-waits for chrony clock synchronization, and clones the configured repository on
-fresh instances. Reused packages and Rust toolchains are kept. `fab install`
-can perform preparation separately. Both need sudo for packages/services.
+`fab install` prepares Ubuntu dependencies, Rust 1.85.0 and chrony on the
+controller and testbed, fetches the configured branch, checks out the controller's
+exact HEAD commit remotely, and compiles the node and client binaries on every
+machine. Only this preparation step requires sudo for packages/services.
 
-Every selected machine fetches the configured branch and checks out the
-controller's current HEAD commit. That commit must be available from the
-configured remote. Controller Rust sources, Cargo manifests/lockfile, and build
-configuration must match HEAD. Benchmark Python parameter and settings edits
-are permitted and are not deployed as native code. Reused remote repositories
-with uncommitted tracked changes are rejected before compilation. This avoids
-silently benchmarking different native code on different machines.
+`fab remote` reuses that build. It verifies the recorded commit and executables,
+generates and uploads configuration, runs the experiment and downloads results.
+It does not install dependencies, update source or compile on either the
+controller or experiment machines. All existing experiment and adversary flags
+remain available. Repeat `fab remote` directly when only workload parameters
+change; repeat `fab install` for new machines or a different source commit.
+After updating from an older installer, run `fab install` once to record the
+successful-build marker. Missing or stale builds fail with that instruction.
+
+The controller's native sources and build configuration must match HEAD, and
+that commit must be available from the configured remote repository. Installation
+rejects remote repositories with uncommitted tracked changes. Build flags and
+locked dependencies remain the same; changing orchestration does not change
+the native protocol or latency measurement code.
 
 Builds clear inherited Rust flag and Tokio-thread overrides and use the
 repository configuration with locked dependencies. Local key generation uses

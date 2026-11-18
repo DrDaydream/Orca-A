@@ -5,7 +5,8 @@ from fabric.exceptions import GroupException
 from invoke.exceptions import Failure
 from paramiko import RSAKey
 from paramiko.ssh_exception import PasswordRequiredException, SSHException
-from os import environ, pathsep
+from os import environ, pathsep, access, X_OK
+from pathlib import Path
 from os.path import basename, splitext, expanduser, join
 from shlex import quote
 from time import sleep
@@ -39,6 +40,8 @@ class ExecutionError(Exception):
 
 
 class Bench:
+    BUILD_MARKER = '.orca-build-commit'
+
     def __init__(self, ctx):
         self.manager = InstanceManager.make()
         self.settings = self.manager.settings
@@ -98,6 +101,7 @@ class Bench:
             f'(cd {repo} && rustup override set 1.85.0)',
         ]
         try:
+            self.revision = self._controller_revision()
             Print.info('Checking build dependencies on the controller...')
             subprocess.run(['bash', '-c', setup], check=True)
             environ['PATH'] = expanduser('~/.cargo/bin') + pathsep + environ.get('PATH', '')
@@ -111,8 +115,10 @@ class Bench:
             Print.info(f'Checking dependencies on {len(hosts)} testbed machines...')
             g = Group(*hosts, user='ubuntu', connect_kwargs=self.connect)
             g.run(' && '.join(cmd), hide=False)
+            self._update(hosts, collocate=True)
+            self._build_local()
             Print.heading(f'Initialized testbed of {len(hosts)} nodes')
-        except (GroupException, ExecutionError, subprocess.SubprocessError) as e:
+        except (GroupException, ExecutionError, subprocess.SubprocessError, OSError, SSHException) as e:
             e = FabricError(e) if isinstance(e, GroupException) else e
             raise BenchError('Failed to install repo on testbed', e)
 
@@ -196,7 +202,7 @@ class Bench:
         else:
             ips = list(set([x for y in hosts for x in y]))
 
-        revision = self._controller_revision()
+        revision = self.revision
         repo = quote(self.settings.repo_name)
         branch = quote(self.settings.branch)
         Print.info(f'Building commit {revision} on {len(ips)} machines...')
@@ -208,31 +214,89 @@ class Bench:
             f'(cd {repo} '
             '&& (git diff --quiet && git diff --cached --quiet || { '
             'echo "Testbed repository has uncommitted tracked changes; '
-            'save or revert them before running fab remote." >&2; exit 1; }) '
+            'save or revert them before running fab install." >&2; exit 1; }) '
             f'&& git fetch origin {branch} '
             f'&& git checkout --detach {revision} '
             f'&& test "$(git rev-parse HEAD)" = {revision} '
-            f'&& cd node && {CommandMaker.compile()})',
+            f'&& cd node && bash -c {quote(self._build_command())})',
             f'ln -sfn {quote("./" + self.settings.repo_name + "/target/release/node")} ./node',
             f'ln -sfn {quote("./" + self.settings.repo_name + "/target/release/benchmark_client")} ./benchmark_client',
         ]
-        g = Group(*ips, user='ubuntu', connect_kwargs=self.connect)
-        g.run(' && '.join(cmd), hide=False)
+        with Group(*ips, user='ubuntu', connect_kwargs=self.connect) as group:
+            group.run(' && '.join(cmd), hide=False)
+
+    def _build_command(self):
+        # Only fab install invokes this; clear success before any rebuild.
+        marker = quote(f'../target/release/{self.BUILD_MARKER}')
+        return '\n'.join([
+            'set -euo pipefail',
+            'export PATH="$HOME/.cargo/bin:$PATH"',
+            'export RUSTUP_TOOLCHAIN=1.85.0',
+            'unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS '
+            'CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS TOKIO_WORKER_THREADS',
+            f'rm -f -- {marker}',
+            CommandMaker.compile(),
+            'test -x ../target/release/node',
+            'test -x ../target/release/benchmark_client',
+            f'printf "%s\\n" {quote(self.revision)} > {marker}',
+        ])
+
+    def _build_local(self):
+        Print.info(f'Building controller commit {self.revision}...')
+        if self._controller_revision() != self.revision:
+            raise ExecutionError('Controller commit changed; rerun fab install')
+        subprocess.run(['bash', '-c', self._build_command()], check=True,
+                       cwd=PathMaker.node_crate_path())
+        try:
+            if self._controller_revision() != self.revision:
+                raise ExecutionError('Controller commit changed during compilation; rerun fab install')
+        except (BenchError, ExecutionError, subprocess.SubprocessError, OSError):
+            Path(PathMaker.binary_path(), self.BUILD_MARKER).unlink(missing_ok=True)
+            raise
+
+    def _binary_check_command(self):
+        release = quote(f'{self.settings.repo_name}/target/release')
+        return ' && '.join([
+            f'test "$(cat {release}/{self.BUILD_MARKER} 2>/dev/null)" = {quote(self.revision)}',
+            'test -x ./node',
+            'test -x ./benchmark_client',
+            f'test ./node -ef {release}/node',
+            f'test ./benchmark_client -ef {release}/benchmark_client',
+        ])
+
+    def _check_binaries(self, hosts):
+        release = Path(PathMaker.binary_path())
+        try:
+            actual = (release / self.BUILD_MARKER).read_text().strip()
+            if actual != self.revision:
+                raise ValueError(f'Controller binaries: {actual}; expected {self.revision}')
+            for name in ('node', 'benchmark_client'):
+                binary = release / name
+                if not binary.is_file() or not access(binary, X_OK):
+                    raise FileNotFoundError(f'Missing executable: {binary}')
+        except (OSError, ValueError) as error:
+            raise BenchError('Controller build is missing or outdated; run fab install first', error)
+        Print.info(f'Using installed commit {self.revision}; checking {len(hosts)} machines...')
+        try:
+            with Group(*hosts, user='ubuntu', connect_kwargs=self.connect,
+                       connect_timeout=15) as group:
+                group.run(self._binary_check_command(), hide=True)
+        except GroupException as error:
+            raise BenchError('Remote build is missing, outdated or unreachable; run fab install first',
+                             FabricError(error))
 
     def _config(self, hosts, node_parameters, bench_parameters):
         Print.info('Generating configuration files...')
+        if self._controller_revision() != self.revision:
+            raise ExecutionError('Controller commit changed; run fab install before retrying')
 
         # Cleanup all local configuration files.
         cmd = CommandMaker.cleanup()
         subprocess.run([cmd], shell=True, stderr=subprocess.DEVNULL)
 
-        # Recompile the latest code.
-        cmd = CommandMaker.compile().split()
-        subprocess.run(cmd, check=True, cwd=PathMaker.node_crate_path())
-
-        # Create alias for the client and nodes binary.
+        # Reuse binaries compiled by fab install.
         cmd = CommandMaker.alias_binaries(PathMaker.binary_path())
-        subprocess.run([cmd], shell=True)
+        subprocess.run([cmd], shell=True, check=True)
 
         # Generate configuration files.
         keys = []
@@ -439,29 +503,21 @@ class Bench:
             raise BenchError('There are not enough instances available', RuntimeError('Run fab info'))
 
         try:
-            self._controller_revision()
+            self.revision = self._controller_revision()
         except (ExecutionError, subprocess.SubprocessError, OSError) as e:
             raise BenchError('Controller code is not ready for remote benchmarking', e)
 
-        # A plain fab remote also prepares fresh Ubuntu 24.04 machines.
-        install_hosts = selected_hosts if bench_parameters.collocate else [
+        ips = selected_hosts if bench_parameters.collocate else [
             ip for group in selected_hosts for ip in group
         ]
-        self.install(hosts=list(dict.fromkeys(install_hosts)))
-
-        # Update nodes.
-        try:
-            self._update(selected_hosts, bench_parameters.collocate)
-        except (GroupException, ExecutionError, subprocess.SubprocessError, OSError) as e:
-            e = FabricError(e) if isinstance(e, GroupException) else e
-            raise BenchError('Failed to update nodes', e)
+        self._check_binaries(list(dict.fromkeys(ips)))
 
         # Upload all configuration files.
         try:
             committee = self._config(
                 selected_hosts, node_parameters, bench_parameters
             )
-        except (subprocess.SubprocessError, GroupException) as e:
+        except (subprocess.SubprocessError, GroupException, ExecutionError, OSError) as e:
             e = FabricError(e) if isinstance(e, GroupException) else e
             raise BenchError('Failed to configure nodes', e)
 
