@@ -33,7 +33,9 @@ class RemoteBenchTests(unittest.TestCase):
     @patch('benchmark.remote.subprocess.run')
     @patch('benchmark.remote.Group')
     def test_install_prepares_controller_and_selected_ubuntu_hosts(self, group, run):
-        with patch.dict('benchmark.remote.environ', {'TOKIO_WORKER_THREADS': '1'}):
+        with patch.dict('benchmark.remote.environ', {'TOKIO_WORKER_THREADS': '1'}), \
+             patch.object(self.bench, '_controller_revision', return_value='a' * 40), \
+             patch.object(self.bench, '_update'), patch.object(self.bench, '_build_local'):
             self.bench.install(hosts=self.hosts)
             from benchmark.remote import environ
             self.assertNotIn('TOKIO_WORKER_THREADS', environ)
@@ -51,9 +53,10 @@ class RemoteBenchTests(unittest.TestCase):
     @patch('benchmark.remote.Group')
     def test_update_builds_exact_controller_commit_without_forcing_remote_edits(self, group):
         revision = '1234567890abcdef' * 2 + '12345678'
+        self.bench.revision = revision
         with patch.object(self.bench, '_controller_revision', return_value=revision):
             self.bench._update(self.hosts, collocate=True)
-        command = group.return_value.run.call_args.args[0]
+        command = group.return_value.__enter__.return_value.run.call_args.args[0]
         self.assertIn(f'git checkout --detach {revision}', command)
         self.assertIn(f'test "$(git rev-parse HEAD)" = {revision}', command)
         self.assertIn('git diff --quiet && git diff --cached --quiet', command)
@@ -93,17 +96,19 @@ class RemoteBenchTests(unittest.TestCase):
         self.bench._controller_revision = MagicMock(return_value='a' * 40)
         self.bench.install = MagicMock()
         self.bench._update = MagicMock()
+        self.bench._check_binaries = MagicMock()
         self.bench._config = MagicMock(return_value=committee)
         self.bench._run_single = MagicMock()
         self.bench._logs = MagicMock(return_value=MagicMock())
         self.bench.kill = MagicMock()
         return self.bench._logs.return_value
 
-    def test_remote_fixture_prepares_runs_and_writes_fixed_window_comparison(self):
+    def test_remote_fixture_reuses_build_and_writes_fixed_window_comparison(self):
         logger = self.fixture_run()
         self.bench.run(self.params, self.node_params)
-        self.bench.install.assert_called_once_with(hosts=self.hosts)
-        self.bench._update.assert_called_once_with(self.hosts, True)
+        self.bench.install.assert_not_called()
+        self.bench._update.assert_not_called()
+        self.bench._check_binaries.assert_called_once_with(self.hosts)
         self.bench._run_single.assert_called_once()
         duration, filename = logger.print_comparison.call_args.args
         self.assertEqual(duration, 20)
