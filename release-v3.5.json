@@ -1,0 +1,39 @@
+{
+  "release": "v3.5-a1-crash-aba-a5-only",
+  "repositories": [
+    {
+      "name": "Orca-A",
+      "directory": "Orca-A",
+      "url": "https://github.com/DrDaydream/Orca-A.git",
+      "branch": "adversary-experiments",
+      "revision": "7a93ba7e433728653fe9eee3fb714c62911ab53a",
+      "base": "c617ac3cfeb69a0dd32ca096ca53c8d62cbb6a83",
+      "bundle": "Orca-A-v3.5.bundle",
+      "bundle_ref": "a1-crash-stop"
+    },
+    {
+      "name": "Orca-B",
+      "directory": "Orca-B-grbc",
+      "url": "https://github.com/DrDaydream/Orca-B.git",
+      "branch": "adversary-experiments",
+      "revision": "d47cedd565376be499bf2f6a5e9b24bbcec290d1",
+      "base": "015346bb6e57af916ec9a0c698d7e34f0236a7a8",
+      "bundle": "Orca-B-v3.5.bundle",
+      "bundle_ref": "a1-crash-stop"
+    },
+    {
+      "name": "Bullshark",
+      "directory": "narwhal-bullshark-ubuntu24",
+      "url": "https://github.com/DrDaydream/narwhal-bullshark-ubuntu24.git",
+      "branch": "adversary-experiments",
+      "revision": "44d59d324e8cb097b70f11a470376f1d4d7c1149",
+      "base": "63fe54ba42ad27a8e6509384521d3c64e57d2648",
+      "bundle": "Bullshark-v3.5.bundle",
+      "bundle_ref": "a1-crash-stop"
+    }
+  ],
+  "toolkit": {
+    "file": "five-protocol-tools-v3.5.zip",
+    "sha256": "c95ec84c18c866c192ef3a96d9314f64877bbf3ff4421c2f47f94568280e78fd"
+  }
+}
