@@ -1,0 +1,25 @@
+{
+  "verified_utc": "2026-11-19T03:02:27.642164+00:00",
+  "feature": "Orca-A v3.4 A0/A3/A5 archive reuse with v3.5 A1 continuation",
+  "checks": {
+    "reuse_regressions_passed": 12,
+    "linux_stop_and_lock_tests_passed": 4,
+    "full_synthetic_import_cases": 72,
+    "new_orca_a_cases_scheduled": 24,
+    "install_calls": 3,
+    "destroy_calls": 3,
+    "mixed_old_new_csv_export": true,
+    "bash_command_syntax": true
+  },
+  "source_directory_unchanged": true,
+  "existing_v35_zip_unchanged": true,
+  "actual_ec2_benchmarks_run": false,
+  "limitations": [
+    "Tests use synthetic logs and owned dummy Linux processes; no user EC2 data was accessed."
+  ],
+  "sha256": {
+    "reuse_orca_a_v34.py": "2422336ef6b2e3c2ecf90c59d178628de89aa993ac726e325a071373bd8d26d3",
+    "stop_matrix_v35.py": "211e1ce152ad8b3efbb1c43da744142c0f66540f46ce433e5c8411d7575611f7",
+    "EC2_v3.4复用与A1续跑.md": "81ff8b1c688aaa6a3082c40ab17e8e78dbf2a6d72325ba783934b791defffd3b"
+  }
+}

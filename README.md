@@ -18,3 +18,9 @@ For A1, rate still divides over the complete committee before crashed clients ar
 `five-protocol-tools-v3.5.zip` includes the plan, runners, archive/plot tools, guide and portable tests. `SHA256SUMS` covers the distribution files. Earlier v3.1-v3.4 ZIPs and guides remain unchanged as historical releases. The old `stop_after_current.py` is retained for its documented older controller workflow.
 
 No AWS credentials, private keys, settings files, conversation transcripts or experiment measurements are included. Validation scope and environment limits are recorded inside the toolkit's verification.json.
+
+## Reuse Orca-A v3.4 evidence
+
+[Stop, update, enter Screen and resume with v3.4 logs](EC2_v3.4复用与A1续跑.md). The separate `reuse_orca_a_v34.py` verifies and copies all 72 compatible Orca-A A0/A3/A5 cases, recalculates their saved latency from the original logs, and records provenance. The existing v3.5 matrix then runs only the 24 Orca-A A1 cases before continuing the other four protocols. Existing completed v3.5 points are retained; failed or interrupted attempts are preserved when selecting an imported success. Old A1 is excluded.
+
+`stop_matrix_v35.py` lists the current controller by default. With `--stop`, it verifies the released v3.4/v3.5 controller, sends one SIGTERM through a PID descriptor, waits for exit and invokes cleanup for that run's output. Download these helpers before updating the installed controller; see the ordered commands in the guide. The existing v3.5 ZIP, runtime scripts and protocol revisions are unchanged.
