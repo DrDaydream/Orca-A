@@ -576,6 +576,8 @@ dependencies = [
  "log",
  "primary",
  "rand",
+ "serde",
+ "serde_json",
  "store",
  "tokio",
  "tokio-util",

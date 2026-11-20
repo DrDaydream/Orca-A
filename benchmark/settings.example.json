@@ -7,7 +7,7 @@
     "repo": {
         "name": "Orca-A",
         "url": "https://github.com/DrDaydream/Orca-A.git",
-        "branch": "orca-a-grbc-echo-ready"
+        "branch": "adversary-experiments"
     },
     "instances": {
         "type": "m5.8xlarge",

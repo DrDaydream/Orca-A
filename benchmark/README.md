@@ -6,13 +6,15 @@ Run the benchmark tasks from this directory with Fabric. `fab local` keeps the
 default 4 nodes, one worker per node, 50,000 tx/s, 512-byte transactions, and
 20-second duration. It builds the current Orca-A checkout in release mode,
 launches local processes, waits for the measurement window to finish, and then
-reaps them before parsing logs. The traditional SUMMARY is followed by a fixed
-20-second final-ordered comparison and a `logs/comparison.json` file. The comparison
-uses the first client start as the window origin, counts first-replica finalized
-transactions, and leaves missing sampled completions unfinished rather than
-assigning them zero latency.
+reaps them before parsing logs. Runs now default to an acknowledged common UTC
+plan. The traditional SUMMARY is followed by a final-ordered comparison and a
+`logs/comparison.json` file. The comparison uses the configured measurement
+window and all active replicas. E2E measures original client release to final
+ordered commit; the companion release cohort exposes unfinished samples.
 
-Edit the parameter dictionaries in `fabfile.py` for other run configurations. The
+Use flags such as `--nodes`, `--rate`, `--header-size`, `--warmup`, and `--drain`
+for other run configurations. See [A1_ACCEPTANCE.md](A1_ACCEPTANCE.md) for the A1
+measurement contract and the separate EC2 acceptance matrix. The
 legacy SUMMARY remains useful for protocol diagnostics; use the final-ordered
 comparison when comparing ordered throughput or client-perceived latency.
 
@@ -34,7 +36,7 @@ if ! command -v rustup >/dev/null 2>&1; then
 fi
 source "$HOME/.cargo/env"
 rustup toolchain install 1.85.0 --profile minimal
-git clone --branch orca-a-grbc-echo-ready https://github.com/DrDaydream/Orca-A.git
+git clone --branch adversary-experiments https://github.com/DrDaydream/Orca-A.git
 cd Orca-A/benchmark
 python3 -m pip install --user --break-system-packages -r requirements.txt
 export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
@@ -146,7 +148,7 @@ fab install
 fab remote
 ```
 
-The example names `DrDaydream/Orca-A`, branch `orca-a-grbc-echo-ready`, and
+The example names `DrDaydream/Orca-A`, branch `adversary-experiments`, and
 `m5.8xlarge` instances. `settings.json` is ignored by Git. Keep private keys and
 AWS access tokens outside the repository. Existing benchmark parameter edits
 in `fabfile.py` are used directly; no command-line parameter changes are needed.

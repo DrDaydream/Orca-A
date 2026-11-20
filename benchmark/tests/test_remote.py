@@ -98,6 +98,7 @@ class RemoteBenchTests(unittest.TestCase):
         self.bench._update = MagicMock()
         self.bench._check_binaries = MagicMock()
         self.bench._config = MagicMock(return_value=committee)
+        self.bench._release_config_storage = MagicMock()
         self.bench._run_single = MagicMock()
         self.bench._logs = MagicMock(return_value=MagicMock())
         self.bench.kill = MagicMock()
@@ -117,13 +118,13 @@ class RemoteBenchTests(unittest.TestCase):
         primary = committee.json['authorities']['key-0']['primary']
         self.assertEqual(set(primary), {'primary_to_primary', 'worker_to_primary'})
 
-    def test_failed_run_stops_every_selected_authority_and_propagates(self):
+    def test_failed_run_propagates_without_global_tmux_cleanup(self):
         self.fixture_run()
         self.bench._run_single.side_effect = ExecutionError('fixture failure')
         # ExecutionError comes from Fabric checks and must reject the run.
         with self.assertRaises(BenchError):
             self.bench.run(self.params, self.node_params)
-        self.assertEqual(set(self.bench.kill.call_args.kwargs['hosts']), set(self.hosts))
+        self.bench.kill.assert_not_called()
 
     @patch('benchmark.remote.Connection')
     def test_remote_window_waits_from_delayed_client_start(self, connection):
