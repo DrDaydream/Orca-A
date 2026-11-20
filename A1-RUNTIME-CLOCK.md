@@ -34,6 +34,10 @@ guarantee. TCP_NODELAY is enabled on accepted and outgoing protocol connections
 and the client input connection. Local payload validation/storage and broadcast
 can progress concurrently with bounded producer backpressure.
 
+Primary stores allow four 64 MiB write buffers to absorb short flush backlogs;
+worker stores retain the default two. See A1-PRIMARY-BUFFERS.md for the measured
+tradeoff, potential memory increase and limits of the local evidence.
+
 Outbound vote capacity is serviced independently by Core. An unsent vote for
 one proposal cannot gate an already-qualified remote proposal's local grades.
 Deferred proposal retries retain the scheduler's original release decision.
