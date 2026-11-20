@@ -94,7 +94,7 @@ impl Primary {
         let (tx_votes, rx_votes) = channel(CHANNEL_CAPACITY);
         let (tx_cert_requests, rx_cert_requests) = channel(CHANNEL_CAPACITY);
         let (tx_consensus_commands, rx_consensus_commands) = channel(CHANNEL_CAPACITY);
-        let (tx_cleanup, rx_cleanup) = channel(CHANNEL_CAPACITY);
+        let (tx_cleanup, rx_cleanup) = tokio::sync::watch::channel(0);
 
         tokio::spawn(async move {
             while let Some(command) = rx_consensus.recv().await {
@@ -113,7 +113,7 @@ impl Primary {
         let secret = keypair.secret;
 
         // Atomic variable use to synchronizer all tasks with the latest consensus round. This is only
-        // used for cleanup. The only tasks that write into this variable is `GarbageCollector`.
+        // used for cleanup. Core publishes this watermark after applying each committed batch.
         let consensus_round = Arc::new(AtomicU64::new(0));
         let in_flight = ProposalTracker::default();
 
@@ -203,7 +203,7 @@ impl Primary {
         );
 
         // Keeps track of the latest consensus round and allows other tasks to clean up their their internal state
-        GarbageCollector::spawn(&name, &committee, consensus_round.clone(), rx_cleanup);
+        GarbageCollector::spawn(&name, &committee, rx_cleanup);
 
         // Receives batch digests from other workers. They are only used to validate headers.
         PayloadReceiver::spawn(store.clone(), /* rx_workers */ rx_others_digests);
