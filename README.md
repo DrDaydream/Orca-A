@@ -1,6 +1,30 @@
 # Five-protocol EC2 experiment tools
 
-Latest: **v3.5** changes Orca-A, Orca-B and Bullshark A1 to whole-run authority crashes: selected primary, worker and client processes are absent. Orca-B delays ABA only in A5; A3 uses ordinary ABA delivery. The tool archives active/crashed IDs and requested/configured offered rates, and plots the load of the clients actually started.
+Latest: **v3.6** uses gRPC SubmitTransactionStream for Orca-A/B. The main plots
+for Orca-A, Orca-B and the current Bullshark/Tusk implementation use independently
+recorded release-to-rule-ready latency. Separate verification plots retain final
+E2E. CSV preserves both endpoints, paired ready-to-final waits and sample counts.
+Mysticeti/Mahi-Mahi retain their existing shared-commit metric, labelled explicitly.
+
+Use [the v3.6 EC2 guide](EC2_v3.6_rule-ready.md),
+[release-v3.6.json](release-v3.6.json), `update_ec2_v36.py`, and
+`five-protocol-tools-v3.6.zip`. Check downloads with `SHA256SUMS-v3.6`.
+The updater preserves the existing directory names and local settings, checks
+merges before changing files, and refuses incompatible local changes without
+writing conflict markers. Use a new output directory:
+`/home/ubuntu/experiments/paper-results-v3.6-grpc-rule-ready`.
+
+The original 480-case plan remains serial: 60 seconds per case, header_size 20 B
+for Orca-A/B/Bullshark, and create -> install -> remote -> destroy per node count.
+A1 remains whole-run crashes for those three protocols. Remote never installs.
+`stop_matrix_v36.py` supports the released v3.4/v3.5/v3.6 controllers.
+Old logs without explicit readiness remain valid final evidence but cannot supply
+the new ready metric. See `METRICS.md` and `verification.json` inside the ZIP.
+Earlier ZIPs, manifests, updaters and guides are preserved.
+
+## Previous release: v3.5
+
+**v3.5** changes Orca-A, Orca-B and Bullshark A1 to whole-run authority crashes: selected primary, worker and client processes are absent. Orca-B delays ABA only in A5; A3 uses ordinary ABA delivery. The tool archives active/crashed IDs and requested/configured offered rates, and plots the load of the clients actually started.
 
 Use [the v3.5 EC2 update and batch-run commands](EC2_v3.5_更新与批量运行.md). `update_ec2_v35.py` updates the three existing controller directories and figure-tools, preserves local parameters that merge cleanly, and checks all local merges before replacing files. An overlap that cannot be merged stops before changing the checkouts; no conflict markers are written. The reviewed protocol revisions are recorded in [release-v3.5.json](release-v3.5.json).
 

@@ -1,0 +1,33 @@
+{
+  "release": "v3.6-grpc-rule-ready",
+  "repositories": [
+    {
+      "name": "Orca-A",
+      "directory": "Orca-A",
+      "url": "https://github.com/DrDaydream/Orca-A.git",
+      "branch": "adversary-experiments",
+      "revision": "ff0321252f2baf74b142a26c91c10a82074d7fc9",
+      "base": "7a93ba7e433728653fe9eee3fb714c62911ab53a"
+    },
+    {
+      "name": "Orca-B",
+      "directory": "Orca-B-grbc",
+      "url": "https://github.com/DrDaydream/Orca-B.git",
+      "branch": "adversary-experiments",
+      "revision": "f0196b50c9777c1cab06bf4c9989586236b8109f",
+      "base": "d47cedd565376be499bf2f6a5e9b24bbcec290d1"
+    },
+    {
+      "name": "Bullshark",
+      "directory": "narwhal-bullshark-ubuntu24",
+      "url": "https://github.com/DrDaydream/narwhal-bullshark-ubuntu24.git",
+      "branch": "adversary-experiments",
+      "revision": "baefa0732f3183f71673eb64a69cdb8d4c309faf",
+      "base": "44d59d324e8cb097b70f11a470376f1d4d7c1149"
+    }
+  ],
+  "toolkit": {
+    "file": "five-protocol-tools-v3.6.zip",
+    "sha256": "b9a001be50b534f7ad61d1f71c367e1fda74b16253dcaef079f343b72fc1a6a8"
+  }
+}
