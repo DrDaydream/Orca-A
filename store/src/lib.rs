@@ -34,6 +34,20 @@ impl Store {
 
     pub fn new(path: &str) -> StoreResult<Self> {
         let db = rocksdb::DB::open_default(path)?;
+        Self::spawn(db)
+    }
+
+    /// Primary proposals need an atomic write before voting or local delivery.
+    /// Allow a short flush backlog without stopping those writes. Each extra
+    /// default-sized memtable can use 64 MiB; worker stores retain their defaults.
+    pub fn new_primary(path: &str) -> StoreResult<Self> {
+        let mut options = rocksdb::Options::default();
+        options.create_if_missing(true);
+        options.set_max_write_buffer_number(4);
+        Self::spawn(rocksdb::DB::open(&options, path)?)
+    }
+
+    fn spawn(db: rocksdb::DB) -> StoreResult<Self> {
         let mut obligations = HashMap::<_, VecDeque<oneshot::Sender<_>>>::new();
         let (tx, mut rx) = channel(100);
         // RocksDB reads, writes and compactions may block. Keep their FIFO

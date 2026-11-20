@@ -88,7 +88,12 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
     };
 
     // Make the data store.
-    let store = Store::new(store_path).context("Failed to create a store")?;
+    let store = if matches.subcommand_name() == Some("primary") {
+        Store::new_primary(store_path)
+    } else {
+        Store::new(store_path)
+    }
+    .context("Failed to create a store")?;
 
     // Channels the sequence of certificates.
     let (tx_output, rx_output) = channel(CHANNEL_CAPACITY);
