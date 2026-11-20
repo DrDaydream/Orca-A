@@ -1,5 +1,7 @@
 # Orca-A complete-proposal GRBC branch
 
+> Current experiment (2026-11-20): local dependency waits are removed from GRBC, round advancement, Dag admission and final output. See [NO-DEPENDENCY-WAIT.md](NO-DEPENDENCY-WAIT.md) for the exact changes, quorum semantics and effects on missing-history output. The dependency waiting behavior and historical validation results below describe the earlier baseline.
+
 This branch starts at Orca-A `54bd1f29fc03414a16da7044e5eb31df92e6212b` and ports the retained broadcast and benchmark changes from Orca-B `a309da2`. The protocol reference is the supplied Orca draft, Section II (GRBC), Section IV (Orca-A), and Algorithm 5 (ordered output). Orca-A keeps its Good, Deferred, and three `r mod 3` pessimistic recovery lanes. It has no ABA subsystem.
 
 ## Broadcast and storage

@@ -86,11 +86,7 @@ struct State {
     dag_strong_support: HashMap<(Round, Digest), HashSet<PublicKey>>,
     observed_direct_support: HashMap<(Round, Digest), HashSet<PublicKey>>,
     dag_direct_support: HashMap<(Round, Digest), HashSet<PublicKey>>,
-    /// Number of strong/weak dependencies not yet admitted to Dag.
-    missing_dependencies: HashMap<Digest, usize>,
-    /// Reverse waiters wake only VDag blocks affected by a new Dag insertion.
-    dependency_waiters: HashMap<Digest, HashSet<Digest>>,
-    /// Grade-2 blocks whose dependency count reached zero.
+    /// Grade-2 blocks awaiting local Dag insertion, regardless of dependencies.
     promotion_queue: VecDeque<Digest>,
     /// The authority designated as leader for every round.
     leaders: HashMap<Round, PublicKey>,
@@ -211,8 +207,6 @@ impl State {
             dag_strong_support: HashMap::new(),
             observed_direct_support: HashMap::new(),
             dag_direct_support: HashMap::new(),
-            missing_dependencies: HashMap::new(),
-            dependency_waiters: HashMap::new(),
             promotion_queue: VecDeque::new(),
             leaders: HashMap::new(),
             adversarial_leaders: HashMap::new(),
@@ -512,13 +506,9 @@ impl State {
                 .iter()
                 .chain(&certificate.header.weak_edges)
             {
-                // With complete history, shared Dag ancestors need no repeat
-                // traversal. While a force-admission gap remains, traverse
-                // them so this owner also waits for any shared missing history.
-                if self.ordered_digests.contains(dependency)
-                    || (self.dag_digests.contains(dependency)
-                        && self.forced_history_waiters.is_empty())
-                {
+                // Grade-two admission no longer proves complete causal history.
+                // Traverse even Dag ancestors to include their now-known data.
+                if self.ordered_digests.contains(dependency) {
                     continue;
                 } else if let Some(ancestor) = self.observed.get(dependency).cloned() {
                     pending.push(ancestor);
@@ -553,26 +543,7 @@ impl State {
             .and_then(|blocks| blocks.get(&origin))
             .map_or(true, |(candidate, _)| candidate != &digest);
         if inserted {
-            let missing: HashSet<_> = certificate
-                .header
-                .parents
-                .iter()
-                .chain(&certificate.header.weak_edges)
-                .filter(|dependency| {
-                    !self.dag_digests.contains(*dependency)
-                        && !self.ordered_digests.contains(*dependency)
-                })
-                .cloned()
-                .collect();
-            for dependency in &missing {
-                self.dependency_waiters
-                    .entry(dependency.clone())
-                    .or_default()
-                    .insert(digest.clone());
-            }
-            self.missing_dependencies
-                .insert(digest.clone(), missing.len());
-            if missing.is_empty() && self.grade_two.contains(&digest) {
+            if self.grade_two.contains(&digest) {
                 self.promotion_queue.push_back(digest.clone());
             }
         }
@@ -648,39 +619,22 @@ impl State {
                 .or_default()
                 .insert(origin);
         }
-        if let Some(waiters) = self.dependency_waiters.remove(&digest) {
-            for waiter in waiters {
-                if let Some(missing) = self.missing_dependencies.get_mut(&waiter) {
-                    *missing = missing.saturating_sub(1);
-                    if *missing == 0 && self.grade_two.contains(&waiter) {
-                        self.promotion_queue.push_back(waiter);
-                    }
-                }
-            }
-        }
         self.wake_pending(round);
     }
 
     fn mark_grade_two(&mut self, digest: Digest) -> bool {
         let inserted = self.grade_two.insert(digest.clone());
-        if inserted
-            && self.missing_dependencies.get(&digest) == Some(&0)
-            && self.observed.contains_key(&digest)
-        {
+        if inserted && self.observed.contains_key(&digest) {
             self.promotion_queue.push_back(digest);
         }
         inserted
     }
 
-    /// Event-driven VDag promotion. A dependency insertion decrements only its
-    /// direct waiters and queues newly ready grade-2 blocks.
+    /// Promote local grade-2 blocks without waiting for strong/weak history.
     fn promote_ready(&mut self) -> Vec<Certificate> {
         let mut promoted = Vec::new();
         while let Some(digest) = self.promotion_queue.pop_front() {
-            if self.dag_digests.contains(&digest)
-                || !self.grade_two.contains(&digest)
-                || self.missing_dependencies.get(&digest) != Some(&0)
-            {
+            if self.dag_digests.contains(&digest) || !self.grade_two.contains(&digest) {
                 continue;
             }
             let certificate = match self.observed.get(&digest).cloned() {
@@ -688,7 +642,6 @@ impl State {
                 None => continue,
             };
             self.promote_to_dag(certificate.clone());
-            self.missing_dependencies.remove(&digest);
             promoted.push(certificate);
         }
         promoted
@@ -781,17 +734,15 @@ impl State {
         self.dag_by_digest
             .retain(|digest, _| live_digests.contains(digest));
         self.dag_digests = live_digests;
-        self.missing_dependencies
-            .retain(|digest, _| observed_digests.contains(digest));
-        self.dependency_waiters.retain(|_, waiters| {
-            waiters.retain(|digest| observed_digests.contains(digest));
-            !waiters.is_empty()
-        });
         self.promotion_queue
             .retain(|digest| observed_digests.contains(digest));
         let dag_digests = &self.dag_digests;
-        self.forced_history_waiters
-            .retain(|digest, _| !dag_digests.contains(digest));
+        let committed = &self.committed_leaders;
+        let skipped = &self.skipped_leaders;
+        self.forced_history_waiters.retain(|digest, owners| {
+            owners.retain(|round| !committed.contains(round) && !skipped.contains(round));
+            !owners.is_empty() && !dag_digests.contains(digest)
+        });
         self.adversarial_leaders
             .retain(|round, _| *round + gc_depth >= last_committed_round);
         self.deferred_rule_one
@@ -1624,12 +1575,8 @@ impl Consensus {
             }
             let leader = self.observed_leader(target_round, state);
             let history = state.fallback_history_snapshot(&anchor);
-            if !history.complete {
-                if leader.is_none() {
-                    self.request_missing_leader(target_round, state).await;
-                }
-                break;
-            }
+            // Experimental fallback uses the available evidence immediately,
+            // even when the causal/virtual history snapshot has gaps.
             let leader_authority = self.ordering_leader_authority(target_round);
             let decision_key = (anchor.round(), target_round);
             let commit = if let Some(commit) =
@@ -1910,10 +1857,6 @@ impl Consensus {
                 .map_or(false, |leader| {
                     state.predecessor_resolved(ready_round)
                         && state.dag_digests.contains(&leader.digest())
-                        && !state
-                            .forced_history_waiters
-                            .values()
-                            .any(|owners| owners.contains(&ready_round))
                 });
             if !leader_ready {
                 continue;
@@ -2143,8 +2086,8 @@ impl Consensus {
             for parent in x.header.parents.iter().chain(&x.header.weak_edges) {
                 let certificate = match state.dag_by_digest.get(parent) {
                     Some(certificate) => certificate,
-                    // The forced-history output barrier handles unknown data;
-                    // exact ordered history may already have been pruned.
+                    // This experiment orders only locally available history;
+                    // missing ancestors do not hold back final output.
                     None => continue,
                 };
 

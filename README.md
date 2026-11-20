@@ -1,5 +1,7 @@
 # Orca-A
 
+> Current experiment (2026-11-20): local dependency waits are removed from GRBC, round advancement, Dag admission and final output. See [NO-DEPENDENCY-WAIT.md](NO-DEPENDENCY-WAIT.md) for the exact changes, quorum semantics and effects on missing-history output. The dependency waiting behavior and historical validation results below describe the earlier baseline.
+
 The `orca-a-grbc-echo-ready` branch implements complete-proposal GRBC and preserves Orca-A's GDP recovery. See [the branch's protocol, measurement and Ubuntu guide](README-GRBC.md) for the updated flow and reproducible commands. Historical performance examples below predate this branch.
 
 [![Rust](https://anonymous.4open.science/r/Orca-A-4DC3/actions/workflows/rust.yml/badge.svg)](https://anonymous.4open.science/r/Orca-A-4DC3/actions/workflows/rust.yml)
