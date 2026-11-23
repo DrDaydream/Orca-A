@@ -132,7 +132,7 @@ impl Core {
                 grade_two: HashSet::new(),
                 round_advance_pending: HashMap::new(),
                 weak_edge_candidates: HashMap::new(),
-                network: ReliableSender::new(),
+                network: crate::adversary::reliable_sender(),
                 cancel_handlers: HashMap::with_capacity(2 * gc_depth as usize),
             }
             .run()
@@ -372,13 +372,21 @@ impl Core {
 
     async fn flush_grbc_outboxes(&mut self) {
         if !self.vote_outbox.is_empty() {
-            let round = self
-                .vote_outbox
-                .iter()
-                .map(|vote| vote.round)
-                .max()
-                .unwrap_or_default();
             let votes = std::mem::take(&mut self.vote_outbox);
+            if self.network.is_scheduled() {
+                // A frame has a single delivery time. Keep evidence from other
+                // rounds outside the configured round's recipient schedule.
+                let mut rounds = std::collections::BTreeMap::<Round, Vec<GradeOneVote>>::new();
+                for vote in votes {
+                    rounds.entry(vote.round).or_default().push(vote);
+                }
+                for (round, batch) in rounds {
+                    self.broadcast_grbc_batch(PrimaryMessage::GradeOneVoteBatch(batch), round)
+                        .await;
+                }
+                return;
+            }
+            let round = votes.iter().map(|vote| vote.round).max().unwrap_or_default();
             self.broadcast_grbc_batch(PrimaryMessage::GradeOneVoteBatch(votes), round)
                 .await;
         }
