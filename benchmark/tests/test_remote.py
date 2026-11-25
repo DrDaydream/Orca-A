@@ -112,6 +112,7 @@ class RemoteBenchTests(unittest.TestCase):
         self.bench._check_binaries.assert_called_once_with(self.hosts)
         self.bench._run_single.assert_called_once()
         duration, filename = logger.print_comparison.call_args.args
+        self.assertEqual(logger.print_comparison.call_args.kwargs, {'verbose': False})
         self.assertEqual(duration, 20)
         self.assertTrue(filename.endswith('-run-1.comparison.json'))
         committee = self.bench._run_single.call_args.args[1]

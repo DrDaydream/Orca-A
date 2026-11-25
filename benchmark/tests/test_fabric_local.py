@@ -25,7 +25,7 @@ class FabricLocalTests(unittest.TestCase):
         self.assertEqual(nodes['max_header_delay'], 200)
         bench.return_value.run.assert_called_once_with(False)
         bench.return_value.run.return_value.print_comparison.assert_called_once_with(
-            20, 'logs/comparison.json')
+            20, 'logs/comparison.json', verbose=False)
 
     def test_actual_fabric_task_failure_exits_nonzero(self):
         # Run the real Fabric dispatcher with only the workload mocked out.

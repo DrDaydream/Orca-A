@@ -235,6 +235,7 @@ class Measurements:
         if any(size % tx_size for size in batch_sizes.values()):
             raise ValueError('Batch bytes are not a whole number of fixed-size transactions')
         replicas = []
+        pooled_release_to_final = []
         for replica, all_final in enumerate(finals):
             final = {batch: at for batch, at in all_final.items() if start <= at < end}
             values, selected, missing_release, missing_ingress, invalid = [], 0, 0, 0, 0
@@ -255,6 +256,7 @@ class Measurements:
                         invalid += 1
                         continue
                     values.append(committed - released)
+            pooled_release_to_final.extend(values)
             byte_count = sum(batch_sizes[batch] for batch in final)
             complete = (bool(values) and not (missing_release or missing_ingress or invalid)
                         and release['instrumented_source_pairs'] == len(self.sources))
@@ -274,6 +276,8 @@ class Measurements:
         complete = bool(replicas) and all(row['coverage_complete'] for row in replicas)
         throughput_complete = bool(replicas) and all(row['throughput_coverage_complete'] for row in replicas)
         matched = sum(row['matched_samples'] for row in replicas)
+        selected = sum(row['selected_samples'] for row in replicas)
+        pooled_complete = bool(matched) and matched == selected and release['status'] == 'available'
         commit = {
             'window_basis': 'planned_final_commit_window',
             'window_start_us': start, 'window_end_us': end, 'window_seconds': seconds,
@@ -281,11 +285,12 @@ class Measurements:
             'coverage_basis': 'selected transaction-replica samples have release, ingress, final and batch bytes; process uptime is verified by the runner',
             'expected_replicas': len(replicas),
             'replicas_with_samples': sum(row['matched_samples'] > 0 for row in replicas),
-            'selected_samples': sum(row['selected_samples'] for row in replicas),
+            'selected_samples': selected,
             'matched_samples': matched, 'coverage_complete': complete,
             'throughput_coverage_complete': throughput_complete,
             'status': 'available' if complete else 'partial' if matched else 'unavailable',
             'mean_replica_release_to_final_ms': mean(row['release_to_final']['mean_ms'] for row in replicas) if complete else None,
+            'pooled_release_to_final': _distribution(pooled_release_to_final) if pooled_complete else None,
             'mean_replica_final_tps': mean(row['final_tps'] for row in replicas) if throughput_complete else None,
             'mean_replica_final_bps': mean(row['final_bps'] for row in replicas) if throughput_complete else None,
             'replicas': replicas,
