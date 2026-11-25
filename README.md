@@ -1,223 +1,158 @@
 # Orca-A
 
-> Current experiment (2026-11-20): local dependency waits are removed from GRBC, round advancement, Dag admission and final output. See [NO-DEPENDENCY-WAIT.md](NO-DEPENDENCY-WAIT.md) for the exact changes, quorum semantics and effects on missing-history output. The dependency waiting behavior and historical validation results below describe the earlier baseline.
+Orca-A is a research implementation of a DAG-based consensus protocol built on Narwhal. Workers collect transactions into batches. Primaries propose them using graded reliable broadcast (GRBC). Orca-A orders leaders with the Good, Deferred and Fallback rules and uses GDP evidence for recovery. The protocol is written in Rust. The Python benchmark uses Fabric to run a whole committee on one machine.
 
-The `orca-a-grbc-echo-ready` branch implements complete-proposal GRBC and preserves Orca-A's GDP recovery. See [the branch's protocol, measurement and Ubuntu guide](README-GRBC.md) for the updated flow and reproducible commands. Historical performance examples below predate this branch.
+This guide covers the `adversary-experiments` branch on Ubuntu 24.04 x86-64. The repository enables SSE4.2 and PCLMUL for this build. [Narwhal and Tusk paper](https://arxiv.org/abs/2105.11827)
 
-[![Rust](https://anonymous.4open.science/r/Orca-A-4DC3/actions/workflows/rust.yml/badge.svg)](https://anonymous.4open.science/r/Orca-A-4DC3/actions/workflows/rust.yml)
-[![Ubuntu](https://img.shields.io/badge/Ubuntu-24.04-E95420?style=flat-square&logo=ubuntu)](https://ubuntu.com/)
-[![license](https://img.shields.io/badge/license-Apache--2.0-blue.svg?style=flat-square)](LICENSE)
+## Quick start
 
-This repository provides an experimental implementation of **Orca-A**, built on the [Narwhal and Tusk](https://arxiv.org/pdf/2105.11827.pdf) codebase. Orca-A extends the original DAG protocol with graded reliable broadcast, VDag storage, strong and virtual references, and three leader commit rules.
+### Install
 
-The codebase is intended for protocol research, benchmarking, and modification. It is not production software, although it uses real cryptography ([dalek](https://doc.dalek.rs/ed25519_dalek)), asynchronous networking ([Tokio](https://docs.rs/tokio)), and persistent storage ([RocksDB](https://rocksdb.org/)).
+Run these commands in Bash. The Rust build uses Clang 14 and its shared library to compile the bundled RocksDB. Cargo reads the compiler and library paths from `.cargo/config.toml`.
 
-## Quick Start
-
-The protocol is implemented in Rust. Benchmark orchestration and result parsing are implemented in Python using [Fabric](https://www.fabfile.org/).
-
-The following commands target Ubuntu 24.04 and install dependencies directly into the current user environment:
-
-~~~bash
-git clone --branch orca-a-grbc-echo-ready --single-branch https://github.com/DrDaydream/Orca-A.git
-cd Orca-A
-
+```bash
 sudo apt-get update
 sudo apt-get install -y \
-  build-essential cmake clang-14 libclang-14-dev curl git tmux \
-  python3 python3-pip
+  git curl ca-certificates build-essential cmake pkg-config libssl-dev \
+  clang-14 libclang-14-dev python3 python3-venv
 
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-source "$HOME/.cargo/env"
+git clone --branch adversary-experiments --single-branch https://github.com/DrDaydream/Orca-A.git
+cd Orca-A
 
-python3 -m pip install --user --break-system-packages \
-  -r benchmark/requirements.txt
-export PATH="$HOME/.local/bin:$PATH"
-~~~
+if [ ! -x "$HOME/.cargo/bin/rustup" ] && ! command -v rustup >/dev/null; then
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.85.0
+fi
+export PATH="$HOME/.cargo/bin:$PATH"
+rustup toolchain install 1.85.0 --profile minimal
 
-RocksDB's bindgen step must use a compatible Clang installation:
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r benchmark/requirements.txt
 
-~~~bash
-export LIBCLANG_PATH=/usr/lib/llvm-14/lib
-export CLANG_PATH=/usr/bin/clang-14
-export CC=/usr/bin/clang-14
-export CXX=/usr/bin/clang++-14
-export CXXFLAGS='-include cstdint'
-~~~
-
-The local benchmark parameters are in `benchmark/fabfile.py`. In particular:
-
-~~~python
-bench_params = {
-    'faults': 0,
-    'nodes': 4,
-    'workers': 1,
-    'rate': 50_000,
-    'tx_size': 512,
-    'duration': 20,
-}
-~~~
-
-The `faults` value enables the dynamic adversary schedule; it does not remove the last f processes. A valid Byzantine configuration must satisfy `nodes >= 3 * faults + 1`.
-
-Run the default local benchmark from the benchmark directory:
-
-~~~bash
 cd benchmark
-fab local
-~~~
+fab --help local
+```
 
-The first run compiles the workspace in release mode with the `benchmark` feature and may take several minutes.
+The repository's `rust-toolchain.toml` selects Rust 1.85.0. In a new shell, activate the virtual environment from the repository root with `source .venv/bin/activate`, then enter `benchmark/`.
 
-### Local adversary options
+### Run a local benchmark
 
-The adversary count for `fab local` comes from `benchmark/fabfile.py`. Set `'faults': 0` for a no-adversary baseline, or set it to a positive value before using the following commands:
+The following commands run from `benchmark/`. The first run builds the release binaries with the `benchmark` feature. Each `fab local` invocation runs one experiment with one input rate. It replaces the previous `logs/` directory and local node databases, so copy any logs you want to keep before the next run.
 
-~~~bash
-# Reproducible default: Rule-3 adversarial leaders are mixed between
-# silence and participation. Clients continue sending during silence.
-ORCA_ADVERSARY_SEED=42 \
-ORCA_RULE3_BEHAVIOR=mixed \
-ORCA_CLIENT_DURING_SILENCE=send \
-fab local
+```bash
+# Four-node baseline with an explicit A0 label in the summary.
+fab local --adversary=A0 --nodes=4 --workers=1 --rate=50000 --tx-size=512 --duration=20
+```
 
-# The same protocol schedule, but clients pause according to the
-# pre-generated wall-clock silence schedule.
-ORCA_ADVERSARY_SEED=42 \
-ORCA_RULE3_BEHAVIOR=mixed \
-ORCA_CLIENT_DURING_SILENCE=pause \
-ORCA_CLIENT_SILENCE_SLOT_MS=200 \
-fab local
+To compare the other modes with the same workload, choose one of the following runs. All three use the local defaults of four nodes, one worker per node, 512-byte transactions and a 20-second measurement window.
 
-# Force every adversarial Rule-3 leader to remain silent.
-ORCA_ADVERSARY_SEED=42 \
-ORCA_RULE3_BEHAVIOR=silent \
-ORCA_CLIENT_DURING_SILENCE=pause \
-fab local
+```bash
+# A1: authority 3 and its client and worker stay offline for the entire run.
+fab local --adversary=A1 --byzantine-ids=3 --rate=50000
 
-# Control case: adversarial Rule-3 leaders continue participating.
-ORCA_ADVERSARY_SEED=42 \
-ORCA_RULE3_BEHAVIOR=participate \
-ORCA_CLIENT_DURING_SILENCE=send \
-fab local
-~~~
+# A3: authority 0 is the fixed Byzantine sender.
+fab local --adversary=A3 --byzantine-ids=0 --seed=7 --delay-ms=200 --rate=50000
 
-The options are:
+# A5: network scheduling across senders with an empty fixed Byzantine set.
+fab local --adversary=A5 --seed=7 --delay-ms=200 --rate=50000
+```
+
+### Workload and timing parameters
+
+| Local option | Default | Meaning |
+|---|---:|---|
+| `--nodes` | 4 | Number of authorities in the full committee, including any authorities selected for A1. |
+| `--workers` | 1 | Workers per authority. Each active worker has one load-generating client. |
+| `--rate` | 50,000 tx/s | Input target for the full committee. Pass a single integer such as `50000`. |
+| `--tx-size` | 512 B | Size of each client transaction in bytes. Minimum 9. |
+| `--duration` | 20 s | Length of the measurement window. Compilation, startup, warmup and drain add to elapsed wall time. |
+| `--warmup` | 0 s | Time to send input before the common measurement window opens. |
+| `--drain` | 0 s | Extra time to observe final commits for previously released samples after input stops. The headline final-commit window ends at the original cutoff. |
+| `--common-clock` | `true` | Coordinate all clients on one measurement window. Use `--common-clock=false` for legacy timing with zero warmup and drain. |
+| `--header-size` | 1,000 B | Batch-digest bytes a primary aims to accumulate before proposing. The proposal timer can trigger earlier once the previous round's parent set is ready. |
+| `--debug` | off | Increase primary and worker log verbosity for this run. |
+
+The launcher assigns each client `ceil(rate / (nodes × workers))` tx/s. For four nodes, one worker each and `--rate=50000`, each client targets 12,500 tx/s. A0 starts four clients, for 50,000 tx/s in total. A1 with one crash starts three clients, for **37,500 tx/s**. The summary's `Input rate` sums the active client targets. Measured throughput appears under `RESULTS`.
+
+### Fault and adversary parameters
+
+| Mode | Local behavior |
+|---|---|
+| `A0` / `none` | Baseline with all authorities active and an empty Byzantine set. |
+| `A1` / `silent` | Full-run crash-stop. The launcher omits the selected primaries, their workers and their clients. The committee keeps its original size and quorum. |
+| `A3` / `targeted` | The fixed Byzantine senders delay selected leader-related GRBC messages within the configured round window. |
+| `A5` / `network` | The network scheduler can delay selected leader-related messages from any sender. The fixed Byzantine set may be empty. |
+
+| Local option | Default | Meaning |
+|---|---|---|
+| `--adversary` | omitted | Select an explicit mode from the table. Bare `fab local` uses the legacy schedule with the configured `faults` value. Use `--adversary=A0` for a labeled baseline. |
+| `--faults` | 0 | With the legacy schedule, controls the number of authorities selected per round while their processes stay online. Explicit A0/A1/A3/A5 runs require zero. |
+| `--byzantine` | 0 | Select a count of fixed authorities. A1 takes the highest launch IDs. A3 and A5 take the lowest IDs. |
+| `--byzantine-ids` | empty | Select specific zero-based launch IDs, e.g. `--byzantine-ids=1,3` in a seven-node committee. Use either this option or a positive `--byzantine` count. |
+| `--seed` | 1 | Seed for the A3/A5 recipient selection. The round and authority keys also enter the selection. Each new local run generates fresh keys. |
+| `--start-round` | 1 | First evidence round eligible for A3/A5 scheduling. |
+| `--attack-rounds` | 0 | Number of eligible rounds starting at `--start-round`. Zero continues through the end of the run. A1 requires the default values for both round options. |
+| `--delay-ms` | 200 ms | Delay applied to each message selected by A3/A5. |
+| `--max-pending-messages` | 4,096 | Upper limit on the number of messages held by the delay scheduler. |
+| `--max-pending-bytes` | 67,108,864 B | Upper limit on bytes held by the delay scheduler (64 MiB). |
+
+The fixed set can contain up to `floor((nodes − 1) / 3)` distinct IDs. A1 and A3 require at least one. In A3 and A5 the scheduler uses the seed and round to select a subset of honest recipients for eligible messages.
+
+For legacy runs that omit `--adversary`, the following environment variables control the original schedule.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `ORCA_ADVERSARY_SEED` | `0` | Deterministic per-round schedule seed |
-| `ORCA_RULE3_BEHAVIOR` | `mixed` | `mixed`, `silent`, or `participate` |
-| `ORCA_CLIENT_DURING_SILENCE` | `send` | Keep client input or pause it in silent slots |
-| `ORCA_CLIENT_SILENCE_SLOT_MS` | `max_header_delay` | Wall-clock schedule slot in milliseconds |
+| `ORCA_ADVERSARY_SEED` | `0` | Seed used to select authorities for each round. |
+| `ORCA_RULE3_BEHAVIOR` | `mixed` | Behavior of a selected Rule 3 leader. Values are `mixed`, `silent` and `participate`. |
+| `ORCA_CLIENT_DURING_SILENCE` | `send` | Keep sending during a scheduled silent slot, or set `pause` to pause client input. |
+| `ORCA_CLIENT_SILENCE_SLOT_MS` | `max_header_delay` | Length in milliseconds of one slot in the client's wall-clock silence schedule. |
 
-With `faults > 0`, every node derives the same f adversarial authorities for each round. An adversarial leader is routed to Rule 3. The non-adversarial Rule-1/Rule-2 schedule approaches a 1:1 split over longer runs. Percentages are calculated over all leaders, including Rule 3 leaders.
+### Batching and synchronization
 
-### No-adversary baseline (`faults = 0`)
+The `node_params` dictionary inside `local()` in `benchmark/fabfile.py` sets the following defaults. `header_size` also has the command-line override shown above.
 
-Set `'faults': 0` in `benchmark/fabfile.py` and run from the benchmark directory:
+| Setting | Default | Meaning |
+|---|---:|---|
+| `header_size` | 1,000 B | Proposal threshold measured in batch-digest bytes. |
+| `max_header_delay` | 200 ms | Primary timer for proposing with the digests collected so far, once the round has its parents. |
+| `gc_depth` | 50 rounds | Round depth used to discard stale synchronization state. |
+| `sync_retry_delay` | 10,000 ms | Time before retrying a request for missing data. |
+| `sync_retry_nodes` | 3 peers | Number of peers selected for a synchronization retry. |
+| `batch_size` | 500,000 B | Worker target for transaction bytes per batch. |
+| `max_batch_delay` | 200 ms | Worker timer for sealing a partial batch. |
 
-~~~bash
-RUST_LOG=info fab local
-~~~
+## Read the results
 
-The following output was produced by a 4-node, 50,000 tx/s, 20-second local run:
+The terminal prints `SUMMARY` with `CONFIG` and `RESULTS`. An explicit-mode run records the selected mode, such as `A3 (targeted)`, and the actual list of Byzantine launch IDs. Reprint the summary from the most recent local logs with:
 
-~~~text
------------------------------------------
- SUMMARY:
------------------------------------------
- + CONFIG:
- Faults: 0 node(s)
- Committee size: 4 node(s)
- Worker(s) per node: 1 worker(s)
- Collocate primary and workers: True
- Input rate: 50,000 tx/s
- Transaction size: 512 B
- Execution time: 20 s
+```bash
+fab logs
+```
 
- Header size: 1,000 B
- Max header delay: 200 ms
- GC depth: 50 round(s)
- Sync retry delay: 10,000 ms
- Sync retry nodes: 3 node(s)
- batch size: 500,000 B
- Max batch delay: 200 ms
+| Summary field | Interpretation |
+|---|---|
+| Consensus TPS / BPS | Committed batch bytes per second, measured from the first proposal to the last observed rule-ready commit. TPS converts bytes using the configured transaction size. |
+| Consensus latency, P50, P99 | One observation per distinct committed batch, from its first proposal to the earliest rule-ready commit recorded by an included replica. |
+| Leader and non-leader latency | Leader rule-ready time, non-leader final commit time, and non-leader rule-order time are reported separately from header creation. Leader commit interval measures the gap between successive leader commits. |
+| Rule 1 / 2 / 3 ratios | Leader ratios count outcomes, including a separate Rule 3 skip category. Block ratios divide the blocks committed by each rule by the total committed blocks. |
+| End-to-end TPS / BPS | In common-clock runs, final transactions or bytes per second in the measurement window, averaged across the included replicas. |
+| End-to-end latency, P50, P99 | From the sampled client's release to ordered final commit at a replica. In common-clock runs the mean weights replica means equally. P50 and P99 pool all valid transaction–replica observations whose final commit falls in the window. |
 
- + RESULTS:
- Consensus TPS: 48,566 tx/s
- Consensus BPS: 24,866,043 B/s
- Consensus latency: 397 ms
- Leader commit latency: 224 ms
- Non-leader commit latency: 572 ms
- All committed headers latency: 505 ms
- Leader commit interval: 192 ms
- Non-leader rule-order latency: 453 ms
- Rule 1 leader ratio: 80.00%
- Rule 2 leader ratio: 8.18%
- Rule 3 commit leader ratio: 0.00%
- Rule 3 skip leader ratio: 11.82%
- Rule 1 block ratio: 90.31%
- Rule 2 block ratio: 9.69%
- Rule 3 block ratio: 0.00%
+Raw logs and `comparison.json` are in `benchmark/logs/`. Explicit-mode runs also write a timestamped parameter snapshot under `benchmark/results/` with the configuration, active launch IDs and offered input rate.
 
- End-to-end TPS: 48,250 tx/s
- End-to-end BPS: 24,703,968 B/s
- End-to-end latency: 546 ms
------------------------------------------
-~~~
+The following excerpt comes from an archived 10-node A0 experiment at 50,000 tx/s, with 512-byte transactions and a 20-byte header threshold. Its timing uses the observed log span. Replaying the archived logs yields these values.
 
-### Preserved adversarial result (`faults = 1`)
-
-For comparison, this is the previously recorded 4-node, 1-fault, 20-second local result using the adversary commands above:
-
-~~~text
------------------------------------------
- SUMMARY:
------------------------------------------
- + CONFIG:
- Faults: 1 node(s)
- Committee size: 4 node(s)
- Worker(s) per node: 1 worker(s)
- Collocate primary and workers: True
- Input rate: 50,000 tx/s
- Transaction size: 512 B
- Execution time: 20 s
-
- Header size: 1,000 B
- Max header delay: 200 ms
- GC depth: 50 round(s)
- Sync retry delay: 10,000 ms
- Sync retry nodes: 3 node(s)
- batch size: 500,000 B
- Max batch delay: 200 ms
-
- + RESULTS:
- Consensus TPS: 37,766 tx/s
- Consensus BPS: 19,336,237 B/s
- Consensus latency: 506 ms
- Leader commit latency: 499 ms
- Non-leader commit latency: 785 ms
- All committed headers latency: 700 ms
- Leader commit interval: 210 ms
- Non-leader rule-order latency: 503 ms
- Rule 1 leader ratio: 41.58%
- Rule 2 leader ratio: 39.60%
- Rule 3 commit leader ratio: 6.93%
- Rule 3 skip leader ratio: 11.88%
- Rule 1 block ratio: 47.13%
- Rule 2 block ratio: 45.22%
- Rule 3 block ratio: 7.64%
-
- End-to-end TPS: 37,487 tx/s
- End-to-end BPS: 19,193,387 B/s
- End-to-end latency: 711 ms
------------------------------------------
-~~~
-
-The legacy SUMMARY's `Consensus latency` ends at the carrying leader's rule-ready time; `End-to-end latency` uses the same endpoint, starting at a sampled client transaction. Use `FINAL ORDERED COMPARISON` and `logs/comparison.json` for final ordered commits over the fixed benchmark window. See [metric definitions](README-GRBC.md#measurement-and-validation). The additional leader, rule-order, and Rule 1/2/3 fields are Orca-A-specific statistics.
-
+```text
+ Adversary mode: A0 (none)
+ Byzantine authority IDs: []
+ Consensus latency: 1,130.982 ms
+ Consensus latency P50: 1,134.000 ms
+ Consensus latency P99: 2,276.000 ms
+ End-to-end latency: 1,515.926 ms
+ End-to-end latency P50: 1,467.481 ms
+ End-to-end latency P99: 3,136.487 ms
+```
 
 ## License
 
-This software is licensed under [Apache License 2.0](LICENSE).
+This project is licensed under the [Apache License 2.0](https://github.com/DrDaydream/Orca-A/blob/adversary-experiments/LICENSE).
